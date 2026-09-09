@@ -21,6 +21,7 @@ Essential guides for initial setup and first builds.
 .. toctree::
    :maxdepth: 1
 
+   authentication
    containers
    bootstrap-constraints
 
@@ -32,7 +33,6 @@ Guides for building packages from various sources and configurations.
 .. toctree::
    :maxdepth: 1
 
-   build-from-git-repo
    repeatable-builds
    parallel
    build-web-server
@@ -47,7 +47,9 @@ Customize builds with overrides, variants, and version handling.
 
    pyproject-overrides
    multiple-versions
+   multiple-version-bootstrap
    pre-release-versions
+   release-age-cooldown
 
 Analyzing Builds
 ----------------

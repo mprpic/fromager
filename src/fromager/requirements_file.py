@@ -33,7 +33,6 @@ class SourceType(StrEnum):
     PREBUILT = "prebuilt"
     SDIST = "sdist"
     OVERRIDE = "override"
-    GIT = "git"
 
 
 def parse_requirements_file(
@@ -65,6 +64,8 @@ def evaluate_marker(
     if not extras:
         marker_envs = [default_env]
     else:
+        # Evaluate once per extra because PEP 508 markers like `extra == "foo"`
+        # can only match one extra value at a time.
         marker_envs = [default_env.copy() | {"extra": e} for e in extras]
 
     for marker_env in marker_envs:

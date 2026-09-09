@@ -7,9 +7,12 @@ import sys
 import typing
 
 import click
+import rich
+import rich.box
 from packaging.requirements import Requirement
-from packaging.utils import canonicalize_name
+from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import Version
+from rich.table import Table
 
 from fromager import clickext, context
 from fromager.commands import bootstrap
@@ -471,6 +474,18 @@ def why(
     type=clickext.PackageVersion(),
     help="Limit subset to specific version of the package",
 )
+@click.option(
+    "--dependencies-only",
+    is_flag=True,
+    default=False,
+    help="Only include the package and its dependencies; exclude dependents (packages that depend on it).",
+)
+@click.option(
+    "--dependents-only",
+    is_flag=True,
+    default=False,
+    help="Only include the package and its dependents; exclude dependencies of the package.",
+)
 @click.argument(
     "graph-file",
     type=str,
@@ -483,6 +498,8 @@ def subset(
     package_name: str,
     output: pathlib.Path | None,
     version: Version | None,
+    dependencies_only: bool,
+    dependents_only: bool,
 ) -> None:
     """Extract a subset of a build graph related to a specific package.
 
@@ -490,9 +507,15 @@ def subset(
     and the dependencies of that package. By default includes all versions of the
     package, but can be limited to a specific version with --version.
     """
+    if dependencies_only and dependents_only:
+        raise click.UsageError(
+            "--dependencies-only and --dependents-only are mutually exclusive"
+        )
     try:
         graph = DependencyGraph.from_file(graph_file)
-        subset_graph = extract_package_subset(graph, package_name, version)
+        subset_graph = extract_package_subset(
+            graph, package_name, version, dependencies_only, dependents_only
+        )
 
         if output:
             with open(output, "w") as f:
@@ -507,18 +530,22 @@ def extract_package_subset(
     graph: DependencyGraph,
     package_name: str,
     version: Version | None = None,
+    dependencies_only: bool = False,
+    dependents_only: bool = False,
 ) -> DependencyGraph:
     """Extract a subset of the graph containing nodes related to a specific package.
 
     Creates a new graph containing:
     - All nodes matching the package name (optionally filtered by version)
-    - All nodes that depend on the target package (dependents)
-    - All dependencies of the target package
+    - All nodes that depend on the target package (dependents), unless dependencies_only is True
+    - All dependencies of the target package, unless dependents_only is True
 
     Args:
         graph: The source dependency graph
         package_name: Name of the package to extract subset for
         version: Optional version to filter target nodes
+        dependencies_only: If True, exclude dependents (packages that depend on the target)
+        dependents_only: If True, exclude dependencies of the target package
 
     Returns:
         A new DependencyGraph containing only the related nodes
@@ -543,18 +570,44 @@ def extract_package_subset(
         related_nodes.add(node.key)
 
     # Traverse up to find dependents (what depends on our package)
-    visited_up: set[str] = set()
-    for target_node in target_nodes:
-        _collect_dependents(target_node, related_nodes, visited_up)
+    if not dependencies_only:
+        visited_up: set[str] = set()
+        for target_node in target_nodes:
+            _collect_dependents(target_node, related_nodes, visited_up)
 
     # Traverse down to find dependencies (what our package depends on)
-    visited_down: set[str] = set()
-    for target_node in target_nodes:
-        _collect_dependencies(target_node, related_nodes, visited_down)
+    if not dependents_only:
+        visited_down: set[str] = set()
+        for target_node in target_nodes:
+            _collect_dependencies(target_node, related_nodes, visited_down)
+
+    # Always include ROOT so the graph is rooted
+    related_nodes.add(ROOT)
 
     # Create new graph with only related nodes
     subset_graph = DependencyGraph()
-    _build_subset_graph(graph, subset_graph, related_nodes)
+    _build_subset_graph(
+        graph, subset_graph, related_nodes, skip_root_edges=dependencies_only
+    )
+
+    # When dependencies_only, target nodes may not be reachable from ROOT
+    # (if they are only transitive deps, not top-level). Add an artificial
+    # ROOT→target edge so the subset graph can be serialized correctly.
+    if dependencies_only:
+        root_node = subset_graph.nodes[ROOT]
+        root_child_keys = {edge.destination_node.key for edge in root_node.children}
+        for target_node in target_nodes:
+            if target_node.key not in root_child_keys:
+                subset_graph.add_dependency(
+                    parent_name=None,
+                    parent_version=None,
+                    req_type=RequirementType.TOP_LEVEL,
+                    req=Requirement(str(target_node.canonicalized_name)),
+                    req_version=target_node.version,
+                    download_url=target_node.download_url,
+                    pre_built=target_node.pre_built,
+                    constraint=target_node.constraint,
+                )
 
     return subset_graph
 
@@ -595,8 +648,17 @@ def _build_subset_graph(
     source_graph: DependencyGraph,
     target_graph: DependencyGraph,
     included_nodes: set[str],
+    skip_root_edges: bool = False,
 ) -> None:
-    """Build the subset graph with only the included nodes and their edges."""
+    """Build the subset graph with only the included nodes and their edges.
+
+    Args:
+        source_graph: The original graph to extract from.
+        target_graph: The graph being built.
+        included_nodes: Keys of nodes to include.
+        skip_root_edges: If True, do not copy edges originating from ROOT.
+            Use this when ROOT edges will be added explicitly afterward.
+    """
     # First pass: add all included nodes
     for node_key in included_nodes:
         source_node = source_graph.nodes[node_key]
@@ -614,6 +676,8 @@ def _build_subset_graph(
 
     # Second pass: add edges between included nodes
     for node_key in included_nodes:
+        if skip_root_edges and node_key == ROOT:
+            continue
         source_node = source_graph.nodes[node_key]
         for child_edge in source_node.children:
             child_key = child_edge.destination_node.key
@@ -784,3 +848,254 @@ def build_graph(
         topo.done(*nodes_to_build)
 
     print(f"\nBuilding {len(graph)} packages in {rounds} rounds.")
+
+
+def get_dependency_closure(node: DependencyNode) -> set[NormalizedName]:
+    """Compute the full dependency closure for a node.
+
+    Traverses all edge types and returns the set of canonical package names reachable from node,
+    including node itself.
+
+    Args:
+        node: The starting node to compute the closure for.
+
+    Returns:
+        Set of canonicalized package names in the transitive closure.
+    """
+    dependency_names: set[NormalizedName] = set()
+    if node.canonicalized_name != ROOT:
+        dependency_names.add(node.canonicalized_name)
+    for dependency in node.iter_all_dependencies():
+        if dependency.canonicalized_name != ROOT:
+            dependency_names.add(dependency.canonicalized_name)
+    return dependency_names
+
+
+def get_package_names(graph: DependencyGraph) -> set[NormalizedName]:
+    """Extract all unique canonical package names from a graph.
+
+    Args:
+        graph: The dependency graph to extract names from.
+
+    Returns:
+        Set of canonicalized package names, excluding the ROOT node.
+    """
+    return {
+        node.canonicalized_name for node in graph.get_all_nodes() if node.key != ROOT
+    }
+
+
+def extract_collection_name(graph_path: str | pathlib.PurePath) -> str:
+    """Derive a collection name from a graph file path.
+
+    Returns the filename without the extension as a string.
+
+    Args:
+        graph_path: Filesystem path to a graph JSON file.
+
+    Returns:
+        The filename without the extension.
+    """
+    return pathlib.PurePath(graph_path).stem
+
+
+class _CollectionScore(typing.NamedTuple):
+    """Overlap score between a package's dependency closure and a collection."""
+
+    collection: str
+    new_packages: int
+    existing_packages: int
+    coverage_percentage: float
+
+
+def _analyze_suggestions(
+    toplevel_nodes: list[DependencyNode],
+    collection_packages: dict[str, set[NormalizedName]],
+) -> list[dict[str, typing.Any]]:
+    """Score each onboarding top-level package against every collection.
+
+    Args:
+        toplevel_nodes: Top-level nodes from the onboarding graph.
+        collection_packages: Mapping of collection name to its package name set.
+
+    Returns:
+        List of result dicts, one per top-level package, sorted by package name.
+    """
+    results: list[dict[str, typing.Any]] = []
+
+    for node in sorted(toplevel_nodes, key=lambda n: n.canonicalized_name):
+        dependency_names = get_dependency_closure(node)
+        total_dependency_count = len(dependency_names)
+
+        scores: list[_CollectionScore] = []
+        for collection_name, packages in collection_packages.items():
+            existing_count = len(dependency_names & packages)
+            new_count = total_dependency_count - existing_count
+            coverage_percentage = (
+                (existing_count / total_dependency_count * 100)
+                if total_dependency_count
+                else 0.0
+            )
+            scores.append(
+                _CollectionScore(
+                    collection_name, new_count, existing_count, coverage_percentage
+                )
+            )
+
+        # Rank: fewest new packages, then highest coverage, then name for determinism
+        scores.sort(
+            key=lambda score: (
+                score.new_packages,
+                -score.coverage_percentage,
+                score.collection,
+            )
+        )
+        best_score = scores[0] if scores else None
+
+        logger.debug(
+            "%s: %d deps, best fit '%s' (%d new, %.1f%% coverage)",
+            node.canonicalized_name,
+            total_dependency_count,
+            best_score.collection if best_score else "none",
+            best_score.new_packages if best_score else 0,
+            best_score.coverage_percentage if best_score else 0.0,
+        )
+
+        results.append(
+            {
+                "package": str(node.canonicalized_name),
+                "version": str(node.version),
+                "total_dependencies": total_dependency_count,
+                "best_fit": best_score.collection if best_score else "none",
+                "new_packages": best_score.new_packages if best_score else 0,
+                "existing_packages": best_score.existing_packages if best_score else 0,
+                "coverage_percentage": (
+                    round(best_score.coverage_percentage, 1) if best_score else 0.0
+                ),
+                "all_collections": [
+                    {
+                        "collection": score.collection,
+                        "new_packages": score.new_packages,
+                        "existing_packages": score.existing_packages,
+                        "coverage_percentage": round(score.coverage_percentage, 1),
+                    }
+                    for score in scores
+                ],
+            }
+        )
+
+    return results
+
+
+def _print_find_best_fit_table(
+    results: list[dict[str, typing.Any]],
+) -> None:
+    """Render find-best-fit results as a Rich table."""
+    table = Table(
+        title="Best-Fit Collection Results for Onboarding Packages",
+        box=rich.box.MARKDOWN,
+        title_justify="left",
+    )
+    table.add_column("Package", justify="left", no_wrap=True)
+    table.add_column("Version", justify="left", no_wrap=True)
+    table.add_column("Total Deps", justify="right", no_wrap=True)
+    table.add_column("Best Fit", justify="left", no_wrap=True)
+    table.add_column("New Pkgs", justify="right", no_wrap=True)
+    table.add_column("Existing", justify="right", no_wrap=True)
+    table.add_column("Coverage", justify="right", no_wrap=True)
+
+    for result in results:
+        table.add_row(
+            result["package"],
+            result["version"],
+            str(result["total_dependencies"]),
+            result["best_fit"],
+            str(result["new_packages"]),
+            str(result["existing_packages"]),
+            f"{result['coverage_percentage']:.1f}%",
+        )
+
+    rich.get_console().print(table)
+
+
+@graph.command(name="find-best-fit")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    help="Output format (default: table)",
+)
+@click.argument("onboarding-graph", type=clickext.ClickPath(exists=True))
+@click.argument(
+    "collection-graphs", nargs=-1, required=True, type=clickext.ClickPath(exists=True)
+)
+def find_best_fit(
+    output_format: str,
+    onboarding_graph: pathlib.Path,
+    collection_graphs: tuple[pathlib.Path, ...],
+) -> None:
+    """Find the best-fit collection for each onboarding package.
+
+    Analyzes dependency overlap between top-level packages in ONBOARDING_GRAPH
+    and the existing COLLECTION_GRAPHS to recommend where each onboarding
+    package should be placed.
+
+    For each top-level package in the onboarding graph, computes the full
+    transitive dependency closure and compares it against every collection.
+    Collections are ranked by fewest new packages required, then by highest
+    dependency coverage.
+
+    \b
+    ONBOARDING_GRAPH  Path to the onboarding collection graph.json.
+    COLLECTION_GRAPHS One or more paths to existing collection graph.json files.
+    """
+    try:
+        onboarding = DependencyGraph.from_file(onboarding_graph)
+    except Exception as err:
+        raise click.ClickException(
+            f"Failed to load onboarding graph {onboarding_graph}: {err}"
+        ) from err
+
+    root = onboarding.get_root_node()
+
+    toplevel_nodes: list[DependencyNode] = [
+        edge.destination_node
+        for edge in root.children
+        if edge.req_type == RequirementType.TOP_LEVEL
+    ]
+
+    if not toplevel_nodes:
+        click.echo("No top-level packages found in onboarding graph.", err=True)
+
+    logger.info(
+        "Loaded onboarding graph with %d top-level packages", len(toplevel_nodes)
+    )
+
+    collection_packages: dict[str, set[NormalizedName]] = {}
+    for graph_path in collection_graphs:
+        collection_name = extract_collection_name(graph_path)
+        if collection_name in collection_packages:
+            raise click.ClickException(
+                f"Duplicate collection name '{collection_name}' from {graph_path}. "
+                "Rename one of the graph files to avoid ambiguity."
+            )
+        try:
+            collection_graph = DependencyGraph.from_file(graph_path)
+        except Exception as err:
+            raise click.ClickException(
+                f"Failed to load collection graph {graph_path}: {err}"
+            ) from err
+        collection_packages[collection_name] = get_package_names(collection_graph)
+        logger.debug(
+            "Collection '%s': %d packages",
+            collection_name,
+            len(collection_packages[collection_name]),
+        )
+
+    results = _analyze_suggestions(toplevel_nodes, collection_packages)
+
+    if output_format == "json":
+        click.echo(json.dumps(results, indent=2))
+    else:
+        _print_find_best_fit_table(results)

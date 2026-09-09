@@ -34,16 +34,16 @@ dependencies = [
     "click>=8.1.7",
     "elfdeps>=0.2.0",
     "license-expression",
-    "packaging",
+    "packaging>=26.1",
+    "packageurl-python",
     "psutil",
-    "pydantic",
+    "pydantic>=2.12",
     "pypi_simple",
     "pyproject_hooks>=1.0.0,!=1.1.0",
     "PyYAML",
     "rich",
     "requests",
     "resolvelib",
-    "requests-mock",
     "starlette",
     "stevedore",
     "tomlkit",
@@ -71,7 +71,10 @@ mypy = [
 test = [
     "coverage[toml]!=4.4,>=4.0",
     "pytest",
+    "pytest-cov",
+    "pytest-xdist",
     "requests-mock",
+    "spdx-tools",
     "twine>=6.1.0",
     "hatchling",
     "hatch-vcs",
@@ -101,7 +104,6 @@ get_build_backend_dependencies = "fromager.dependencies:default_get_build_backen
 get_build_sdist_dependencies = "fromager.dependencies:default_get_build_sdist_dependencies"
 resolver_provider = "fromager.resolver:default_resolver_provider"
 download_source = "fromager.sources:default_download_source"
-resolve_source = "fromager.sources:default_resolve_source"
 build_sdist = "fromager.sources:default_build_sdist"
 build_wheel = "fromager.wheels:default_build_wheel"
 
@@ -131,11 +133,10 @@ lint-requirements = "fromager.commands.lint_requirements:lint_requirements"
 branch = true
 parallel = true
 relative_files = true
-source = ["fromager", "tests/"]
+source = ["fromager"]
 
 [tool.coverage.paths]
 source = ["src/fromager", ".hatch/**/site-packages/fromager"]
-tests = ["tests/"]
 
 [tool.coverage.report]
 show_missing = true
@@ -201,11 +202,13 @@ follow_imports = "silent"
 exclude = [
     "^e2e/.*/build/.*$",
     "^e2e/pyo3_test/.*$",
+    "^e2e/gitlab_override_example/.*$",
+    "^e2e/github_override_example/.*$",
 ]
 
 [[tool.mypy.overrides]]
 # packages without typing annotations and stubs
-module = ["hatchling", "hatchling.build", "license_expression", "pyproject_hooks", "requests_mock", "resolver", "stevedore"]
+module = ["hatchling", "hatchling.build", "license_expression", "pyproject_hooks", "requests_mock", "resolver", "spdx_tools.*", "stevedore", "wheel.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]
@@ -228,8 +231,10 @@ features = ["test"]
 # {args:tests} allows passing arguments to specify which tests to run
 
 [tool.hatch.envs.test.scripts]
-test = "python -m coverage run -m pytest --log-level DEBUG -vv {args:tests}"
-coverage-report = ["coverage combine", "coverage report --format=markdown"]
+test = "python -m pytest --cov -vv {args:tests}"
+coverage-erase = "coverage erase"
+coverage-combine = "coverage combine"
+coverage-report = ["coverage combine", "coverage report --format=markdown | tee coverage-report-$(date +%Y%m%d-%H%M%S).md"]
 
 [tool.hatch.envs.lint]
 description = "Run linters."
@@ -289,6 +294,9 @@ features = ["docs"]
 build = "sphinx-build -M html docs docs/_build -j auto --keep-going {args:--fail-on-warning --fresh-env -n}"
 
 [tool.pytest.ini_options]
+# run tests in parallel with 3 pytest-xdist workers
+addopts = "-n 3"
+testpaths = ["tests"]
 markers = [
     "network: test that need network access",
 ]

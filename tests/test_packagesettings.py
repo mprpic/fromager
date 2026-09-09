@@ -13,6 +13,7 @@ from fromager.packagesettings import (
     Annotations,
     BuildDirectory,
     EnvVars,
+    ExternalCommands,
     GitOptions,
     Package,
     PackageBuildInfo,
@@ -23,12 +24,15 @@ from fromager.packagesettings import (
     Variant,
     substitute_template,
 )
+from fromager.packagesettings._models import DeleteEnvPattern, KeepEnvPattern
+from fromager.packagesettings._typedefs import PurlType, UpstreamPurl
 
 TEST_PKG = "test-pkg"
 TEST_EMPTY_PKG = "test-empty-pkg"
 TEST_OTHER_PKG = "test-other-pkg"
 TEST_RELATED_PKG = "test-pkg-library"
 TEST_PREBUILT_PKG = "test-prebuilt-pkg"
+TEST_COOLDOWN_PKG = "test-cooldown-pkg"
 
 FULL_EXPECTED: dict[str, typing.Any] = {
     "annotations": {
@@ -72,6 +76,7 @@ FULL_EXPECTED: dict[str, typing.Any] = {
     },
     "name": "test-pkg",
     "has_config": True,
+    "purl": None,
     "project_override": {
         "remove_build_requires": ["cmake"],
         "update_build_requires": ["setuptools>=68.0.0", "torch"],
@@ -83,6 +88,7 @@ FULL_EXPECTED: dict[str, typing.Any] = {
         "sdist_server_url": "https://sdist.test/egg",
         "ignore_platform": True,
         "use_pypi_org_metadata": True,
+        "min_release_age": None,
     },
     "variants": {
         "cpu": {
@@ -132,6 +138,7 @@ EMPTY_EXPECTED: dict[str, typing.Any] = {
         "submodule_paths": [],
     },
     "has_config": True,
+    "purl": None,
     "project_override": {
         "remove_build_requires": [],
         "update_build_requires": [],
@@ -143,6 +150,7 @@ EMPTY_EXPECTED: dict[str, typing.Any] = {
         "include_wheels": False,
         "ignore_platform": False,
         "use_pypi_org_metadata": None,
+        "min_release_age": None,
     },
     "variants": {},
 }
@@ -171,6 +179,7 @@ PREBUILT_PKG_EXPECTED: dict[str, typing.Any] = {
         "submodule_paths": [],
     },
     "has_config": True,
+    "purl": None,
     "project_override": {
         "remove_build_requires": [],
         "update_build_requires": [],
@@ -182,6 +191,7 @@ PREBUILT_PKG_EXPECTED: dict[str, typing.Any] = {
         "include_wheels": False,
         "ignore_platform": False,
         "use_pypi_org_metadata": None,
+        "min_release_age": None,
     },
     "variants": {
         "cpu": {
@@ -314,9 +324,12 @@ def test_pbi_test_pkg_extra_environ(
     )
     assert "__version__" not in result
 
+    sdist_root = tmp_path / "test-pkg-1.0.0"
+    sdist_root.mkdir()
     build_env = build_environment.BuildEnvironment(
-        testdata_context,
-        parent_dir=tmp_path,
+        ctx=testdata_context,
+        req=Requirement("test-pkg"),
+        sdist_root_dir=sdist_root,
     )
     result = pbi.get_extra_environ(
         template_env={"EXTRA": "spam", "PATH": "/sbin:/bin"},
@@ -484,6 +497,32 @@ def test_type_builddirectory() -> None:
         ta.validate_python("/absolute/path")
 
 
+def test_type_purl_type() -> None:
+    """Verify PurlType normalizes and rejects empty strings."""
+    ta = pydantic.TypeAdapter(PurlType)
+    assert ta.validate_python("pypi") == "pypi"
+    assert ta.validate_python("  Generic  ") == "generic"
+    assert ta.validate_python("GITHUB") == "github"
+    with pytest.raises(ValueError):
+        ta.validate_python("")
+    with pytest.raises(ValueError):
+        ta.validate_python("   ")
+
+
+def test_type_upstream_purl() -> None:
+    """Verify UpstreamPurl accepts valid purls and rejects invalid strings."""
+    ta = pydantic.TypeAdapter(UpstreamPurl)
+    assert ta.validate_python("pkg:pypi/flask@2.0") == "pkg:pypi/flask@2.0"
+    assert (
+        ta.validate_python("pkg:github/vllm-project/bart-plugin@v0.2.0")
+        == "pkg:github/vllm-project/bart-plugin@v0.2.0"
+    )
+    with pytest.raises(ValueError):
+        ta.validate_python("invalid-not-purl")
+    with pytest.raises(ValueError):
+        ta.validate_python("")
+
+
 def test_global_settings(testdata_path: pathlib.Path) -> None:
     filename = testdata_path / "context/overrides/settings.yaml"
     gs = SettingsFile.from_file(filename)
@@ -501,6 +540,7 @@ def test_settings_overrides(testdata_context: context.WorkContext) -> None:
         TEST_OTHER_PKG,
         TEST_RELATED_PKG,
         TEST_PREBUILT_PKG,
+        TEST_COOLDOWN_PKG,
     }
 
 
@@ -546,9 +586,10 @@ def test_global_changelog(testdata_context: context.WorkContext) -> None:
 
 def test_settings_list(testdata_context: context.WorkContext) -> None:
     assert testdata_context.settings.list_overrides() == {
+        TEST_COOLDOWN_PKG,
+        TEST_PKG,
         TEST_EMPTY_PKG,
         TEST_OTHER_PKG,
-        TEST_PKG,
         TEST_RELATED_PKG,
         TEST_PREBUILT_PKG,
     }
@@ -561,7 +602,7 @@ def test_settings_list(testdata_context: context.WorkContext) -> None:
     ]
 
 
-@patch("fromager.packagesettings._pbi.get_cpu_count", return_value=8)
+@patch("fromager.threading_utils.get_cpu_count", return_value=8)
 @patch("fromager.packagesettings._pbi.get_available_memory_gib", return_value=7.1)
 def test_parallel_jobs(
     get_available_memory_gib: Mock,
@@ -850,11 +891,7 @@ def _make_pbi(env_yaml: str, tmp_path: pathlib.Path) -> PackageBuildInfo:
 def test_version_env_var_raises_when_version_unknown(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Using ${__version__} in env without a fallback raises when version is None.
-
-    This mirrors the git-URL bootstrap path where the version has not yet
-    been resolved (e.g. ``pkg @ git+https://host/repo.git@main``).
-    """
+    """Using ${__version__} in env without a fallback raises when version is None."""
     pbi = _make_pbi(
         """
 env:
@@ -896,3 +933,222 @@ env:
     result = pbi.get_extra_environ(template_env={}, version=None)
     assert result["FOO"] == "bar"
     assert "__version__" not in result
+
+
+# --- ExternalCommands / env pattern tests ---
+
+
+@pytest.mark.parametrize("valid", ["HOME", "CARGO_*", "X", "_FOO", "_1A*"])
+def test_type_keep_env_pattern_valid(valid: str) -> None:
+    """Verify `KeepEnvPattern` accepts well-formed patterns."""
+    ta = pydantic.TypeAdapter(KeepEnvPattern)
+    assert ta.validate_python(valid) == valid
+
+
+@pytest.mark.parametrize(
+    "invalid", ["*", "A*B", "", "   ", " AWS_*", "AWS_* ", "1BAD", "foo-bar"]
+)
+def test_type_keep_env_pattern_invalid(invalid: str) -> None:
+    """Verify `KeepEnvPattern` rejects bare ``*``, mid-``*``, empty, whitespace, and bad chars."""
+    ta = pydantic.TypeAdapter(KeepEnvPattern)
+    with pytest.raises(pydantic.ValidationError):
+        ta.validate_python(invalid)
+
+
+@pytest.mark.parametrize("valid", ["CI_TOKEN", "AWS_*", "*", "_X"])
+def test_type_delete_env_pattern_valid(valid: str) -> None:
+    """Verify `DeleteEnvPattern` accepts valid patterns including bare ``*``."""
+    ta = pydantic.TypeAdapter(DeleteEnvPattern)
+    assert ta.validate_python(valid) == valid
+
+
+@pytest.mark.parametrize("invalid", ["A*B", "", " *", "1BAD", "foo-bar"])
+def test_type_delete_env_pattern_invalid(invalid: str) -> None:
+    """Verify `DeleteEnvPattern` rejects mid-``*``, empty, whitespace, and bad chars."""
+    ta = pydantic.TypeAdapter(DeleteEnvPattern)
+    with pytest.raises(pydantic.ValidationError):
+        ta.validate_python(invalid)
+
+
+def test_external_commands_valid() -> None:
+    """Valid configs, defaults, and frozen behavior."""
+    # both lists
+    ec = ExternalCommands(
+        keep_env=["CARGO_*", "HOME"],
+        delete_env=["CI_TOKEN", "AWS_*"],
+    )
+    assert ec.keep_env == ["CARGO_*", "HOME"]
+    assert ec.delete_env == ["CI_TOKEN", "AWS_*"]
+
+    # catch-all delete
+    ec = ExternalCommands(delete_env=["*"])
+    assert ec.keep_env == []
+    assert ec.delete_env == ["*"]
+
+    # defaults
+    ec = ExternalCommands()
+    assert ec.keep_env == []
+    assert ec.delete_env == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"keep_env": ["*"]}, id="bare-star-keep"),
+        pytest.param({"keep_env": ["A*B"]}, id="mid-star"),
+        pytest.param({"delete_env": ["*", "AWS_*"]}, id="star-with-others"),
+        pytest.param({"delete_env": ["HOME"]}, id="delete-default-keep"),
+        pytest.param({"delete_env": ["LC_*"]}, id="delete-default-keep-prefix"),
+        pytest.param(
+            {"keep_env": ["CARGO_*"], "delete_env": ["CARGO_*"]},
+            id="delete-overlaps-keep",
+        ),
+        pytest.param({"unknown_key": "value"}, id="extra-forbid"),
+    ],
+)
+def test_external_commands_invalid(kwargs: dict[str, typing.Any]) -> None:
+    """Invalid ``ExternalCommands`` configurations must raise."""
+    with pytest.raises(pydantic.ValidationError):
+        ExternalCommands.model_validate(kwargs)
+
+
+def test_settings_file_external_commands(tmp_path: pathlib.Path) -> None:
+    """Parse ``external_commands`` from YAML and access via ``Settings``."""
+    # absent → empty default
+    assert not SettingsFile.from_string("").external_commands.delete_env
+
+    # present
+    sf = SettingsFile.from_string(
+        """
+external_commands:
+  keep_env:
+    - "CARGO_*"
+  delete_env:
+    - "CI_TOKEN"
+"""
+    )
+    assert sf.external_commands.delete_env
+    assert sf.external_commands.keep_env == ["CARGO_*"]
+    assert sf.external_commands.delete_env == ["CI_TOKEN"]
+
+    # Settings property proxies SettingsFile
+    settings = Settings(
+        settings=sf,
+        package_settings=[],
+        variant="cpu",
+        patches_dir=tmp_path,
+        max_jobs=1,
+    )
+    assert settings.external_commands is sf.external_commands
+
+    settings_no_filter = Settings(
+        settings=SettingsFile(),
+        package_settings=[],
+        variant="cpu",
+        patches_dir=tmp_path,
+        max_jobs=1,
+    )
+    assert not settings_no_filter.external_commands.delete_env
+
+
+# --- ExternalCommands.filter_env tests ---
+
+_ENV = {"HOME": "/h", "PATH": "/bin", "LC_ALL": "C", "SECRET": "s", "AWS_KEY": "k"}
+
+
+def test_filter_env_no_delete() -> None:
+    """No delete_env configured keeps all POSIX-compliant keys."""
+    ec = ExternalCommands()
+    assert ec.filter_env(_ENV) == _ENV
+
+
+def test_filter_env_no_delete_strips_non_posix() -> None:
+    """Non-POSIX keys are removed even without delete_env."""
+    ec = ExternalCommands()
+    env = {"HOME": "/h", "dot.key": "x", "BASH_FUNC_f%%": "y"}
+    assert ec.filter_env(env) == {"HOME": "/h"}
+
+
+@pytest.mark.parametrize(
+    "keep,delete,env,expected",
+    [
+        pytest.param(
+            [],
+            ["SECRET"],
+            _ENV,
+            {"HOME": "/h", "PATH": "/bin", "LC_ALL": "C", "AWS_KEY": "k"},
+            id="exact-delete",
+        ),
+        pytest.param(
+            [],
+            ["AWS_*"],
+            _ENV,
+            {"HOME": "/h", "PATH": "/bin", "LC_ALL": "C", "SECRET": "s"},
+            id="prefix-delete",
+        ),
+        pytest.param(
+            ["CI_SAFE"],
+            ["CI_*"],
+            {"CI_SAFE": "1", "CI_TOKEN": "x"},
+            {"CI_SAFE": "1"},
+            id="keep-protects-from-delete",
+        ),
+        pytest.param(
+            [],
+            ["*"],
+            _ENV,
+            {"HOME": "/h", "PATH": "/bin", "LC_ALL": "C"},
+            id="delete-all",
+        ),
+        pytest.param(
+            ["AWS_*"],
+            ["*"],
+            _ENV,
+            {"HOME": "/h", "PATH": "/bin", "LC_ALL": "C", "AWS_KEY": "k"},
+            id="delete-all-user-keep",
+        ),
+        pytest.param(
+            [],
+            ["CI_*"],
+            {"X": "1", "CI_T": "2"},
+            {"X": "1"},
+            id="unmatched-kept",
+        ),
+        pytest.param(
+            [],
+            ["secret"],
+            {"SECRET": "gone", "secret": "gone", "Other": "kept"},
+            {"Other": "kept"},
+            id="delete-case-insensitive",
+        ),
+        pytest.param(
+            ["my_var"],
+            ["*"],
+            {"my_var": "kept", "MY_VAR": "gone"},
+            {"my_var": "kept"},
+            id="keep-case-sensitive",
+        ),
+        pytest.param(
+            [],
+            ["SECRET"],
+            {"HOME": "/h", "SECRET": "s", "dot.key": "x", "BASH_FUNC_f%%": "y"},
+            {"HOME": "/h"},
+            id="non-posix-keys-removed",
+        ),
+        pytest.param(
+            ["KEEP_ME"],
+            ["*"],
+            {"KEEP_ME": "ok", "1BAD": "x", "k-v": "y"},
+            {"KEEP_ME": "ok"},
+            id="non-posix-keys-removed-delete-all",
+        ),
+    ],
+)
+def test_filter_env(
+    keep: list[str],
+    delete: list[str],
+    env: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    ec = ExternalCommands(keep_env=keep, delete_env=delete)
+    assert ec.filter_env(env) == expected

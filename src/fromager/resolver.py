@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime
+import enum
 import functools
 import logging
 import os
@@ -14,7 +15,7 @@ import typing
 from collections.abc import Iterable
 from operator import attrgetter
 from platform import python_version
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, urlparse
 
 import pypi_simple
 import resolvelib
@@ -31,8 +32,9 @@ from requests.models import Response
 from resolvelib.resolvers import RequirementInformation
 
 from . import overrides
-from .candidate import Candidate
+from .candidate import Candidate, Cooldown
 from .constraints import Constraints
+from .downloads import extract_filename_from_url as extract_filename_from_url
 from .extras_provider import ExtrasProvider
 from .http_retry import RETRYABLE_EXCEPTIONS, retry_on_exception
 from .request_session import session
@@ -57,6 +59,14 @@ IGNORE_PLATFORM: str = "ignore"
 SUPPORTED_TAGS_IGNORE_PLATFORM: frozenset[Tag] = frozenset(
     Tag(t.interpreter, t.abi, IGNORE_PLATFORM) for t in SUPPORTED_TAGS
 )
+
+
+class AgeFallback(enum.StrEnum):
+    """Strategy when max-release-age filtering removes all candidates."""
+
+    ALL = "all"
+    NEWEST = "newest"
+    NONE = "none"
 
 
 @functools.lru_cache(maxsize=200)
@@ -86,6 +96,10 @@ def resolve(
     req_type: RequirementType | None = None,
     ignore_platform: bool = False,
 ) -> tuple[str, Version]:
+    """Resolve requirement and return the best matching version.
+
+    Returns (url, version) tuple for the highest matching version.
+    """
     # Create the (reusable) resolver.
     provider = overrides.find_and_invoke(
         req.name,
@@ -99,7 +113,12 @@ def resolve(
         req_type=req_type,
         ignore_platform=ignore_platform,
     )
-    return resolve_from_provider(provider, req)
+    provider.cooldown = resolve_package_cooldown(ctx, req, req_type=req_type)
+    max_age_cutoff = _compute_max_age_cutoff(ctx)
+    results = find_all_matching_from_provider(
+        provider, req, max_age_cutoff=max_age_cutoff
+    )
+    return results[0]
 
 
 def default_resolver_provider(
@@ -128,11 +147,71 @@ def default_resolver_provider(
     )
 
 
-def extract_filename_from_url(url: str) -> str:
-    """Extract filename from URL and decode it."""
-    path = urlparse(url).path
-    filename = os.path.basename(path)
-    return unquote(filename)
+def _has_equality_pin(req: Requirement) -> bool:
+    """Return True if the requirement has a single exact ``==`` pin.
+
+    Rejects wildcard pins (``==1.*``) and compound specifiers (``==1,>2``)
+    which are not true exact version pins.
+    """
+    specs = list(req.specifier)
+    return len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version
+
+
+def resolve_package_cooldown(
+    ctx: context.WorkContext,
+    req: Requirement,
+    req_type: RequirementType | None = None,
+) -> Cooldown | None:
+    """Compute the effective cooldown for a single package.
+
+    Args:
+        ctx: The current work context (provides the global cooldown).
+        req: The package requirement being resolved.
+        req_type: The requirement type (top-level, install, etc.).
+
+    Returns:
+        The cooldown to pass to the provider, or ``None`` if disabled.
+    """
+    if req_type == RequirementType.TOP_LEVEL and _has_equality_pin(req):
+        if ctx.cooldown is not None:
+            logger.info("cooldown bypassed as the top-level requirement uses == pin")
+        return None
+
+    per_package_days = ctx.package_build_info(req).resolver_min_release_age
+    global_cooldown = ctx.cooldown
+    if per_package_days is None:
+        return global_cooldown
+    if per_package_days == 0:
+        return None
+    # Per-package positive override: inherit bootstrap_time from global so all
+    # resolutions in a single run share the same fixed cutoff point.
+    bootstrap_time = (
+        global_cooldown.bootstrap_time
+        if global_cooldown is not None
+        else datetime.datetime.now(datetime.UTC)
+    )
+    return Cooldown(
+        min_age=datetime.timedelta(days=per_package_days),
+        bootstrap_time=bootstrap_time,
+    )
+
+
+def _compute_max_age_cutoff(
+    ctx: context.WorkContext,
+) -> datetime.datetime | None:
+    """Compute the cutoff time for max release age filtering.
+
+    Returns the oldest acceptable upload time, or None if disabled.
+    Uses the cooldown's bootstrap_time for consistency across a single run.
+    """
+    if ctx.max_release_age is None:
+        return None
+    bootstrap_time = (
+        ctx.cooldown.bootstrap_time
+        if ctx.cooldown is not None
+        else datetime.datetime.now(datetime.UTC)
+    )
+    return bootstrap_time - ctx.max_release_age
 
 
 class LogReporter(resolvelib.BaseReporter):
@@ -163,28 +242,136 @@ class LogReporter(resolvelib.BaseReporter):
         self._report("successfully resolved %r", self.req)
 
 
-def resolve_from_provider(
-    provider: BaseProvider, req: Requirement
-) -> tuple[str, Version]:
-    reporter = LogReporter(req)
-    rslvr: resolvelib.Resolver = resolvelib.Resolver(provider, reporter)
+def find_all_matching_from_provider(
+    provider: BaseProvider,
+    req: Requirement,
+    max_age_cutoff: datetime.datetime | None = None,
+    age_fallback: AgeFallback = AgeFallback.ALL,
+) -> list[tuple[str, Version]]:
+    """Find all matching candidates from provider without full dependency resolution.
+
+    This function collects ALL candidates that match the requirement, rather than
+    performing full dependency resolution to find a single best candidate.
+
+    Args:
+        provider: The provider to query for candidates.
+        req: The requirement to match.
+        max_age_cutoff: If set, reject candidates published before this time.
+            Age filtering is skipped for packages that have an exact
+            ``==`` pin in the provider's ``constraints`` object, since
+            a pin represents explicit user intent that should not be
+            overridden by a heuristic.  Range constraints (``>=``,
+            ``<``, etc.) still go through age filtering normally.
+        age_fallback: Strategy when age filtering removes all candidates.
+            ``ALL`` (default) keeps every candidate with a warning.
+            ``NEWEST`` keeps only the single newest candidate.
+            ``NONE`` returns an empty list, letting the caller handle it.
+
+    Returns list of (url, version) tuples sorted by version (highest first).
+
+    IMPORTANT: This bypasses resolvelib's full resolver to collect all matching
+    candidates. This is safe ONLY because BaseProvider.get_dependencies() returns
+    an empty list (no transitive dependencies to resolve). The empty incompatibilities
+    dict means no version is ever excluded based on conflicts.
+
+    If get_dependencies() is ever extended to return actual dependencies, this
+    function must be revisited to use resolvelib's full resolution algorithm
+    (Resolver.resolve()) to properly handle dependency conflicts and backtracking.
+    """
+    # Get all matching candidates directly from provider
+    # instead of using resolvelib's resolver which picks just one
+    identifier = provider.identify(req)
     try:
-        result = rslvr.resolve([req])
+        # Bypass resolvelib's resolver to collect all matching candidates rather than
+        # just the single best one. This is safe because get_dependencies() returns []
+        # (no transitive deps to resolve). If get_dependencies() is ever extended,
+        # this must be revisited to use resolvelib's full resolution.
+        candidates = provider.find_matches(
+            identifier=identifier,
+            requirements={identifier: [req]},
+            incompatibilities={},  # Empty - safe only because no transitive deps
+        )
     except resolvelib.resolvers.ResolverException as err:
         constraint = provider.constraints.get_constraint(req.name)
         provider_desc = provider.get_provider_description()
-        # Include the original error message to preserve detailed information
-        # (e.g., file types, pre-release info from PyPIProvider)
         original_msg = str(err)
         raise resolvelib.resolvers.ResolverException(
             f"Unable to resolve requirement specifier {req} with constraint {constraint} using {provider_desc}: {original_msg}"
         ) from err
-    # resolvelib actually just returns one candidate per requirement.
-    # result.mapping is map from an identifier to its resolved candidate
-    candidate: Candidate
-    for candidate in result.mapping.values():
-        return candidate.url, candidate.version
-    raise ValueError(f"Unable to resolve {req}")
+
+    # Materialize candidates so we can iterate more than once if filtering
+    candidates_list = list(candidates)
+
+    if max_age_cutoff is not None:
+        # Exact == pins in constraints are explicit user intent — skip age filtering.
+        constraint = provider.constraints.get_constraint(req.name)
+        is_pinned = constraint is not None and _has_equality_pin(constraint)
+
+        if is_pinned:
+            logger.info(
+                "%s: skipping age filter for pinned constraint (%d candidate(s))",
+                req.name,
+                len(candidates_list),
+            )
+        else:
+            logger.info(
+                "%s: found %d candidate(s) matching %s",
+                req.name,
+                len(candidates_list),
+                req,
+            )
+            max_age_days = (datetime.datetime.now(datetime.UTC) - max_age_cutoff).days
+            filtered = [
+                c
+                for c in candidates_list
+                if c.upload_time is None or c.upload_time >= max_age_cutoff
+            ]
+            dropped = len(candidates_list) - len(filtered)
+            if dropped:
+                logger.info(
+                    "%s: have %d candidate(s) of %s published within %d days",
+                    req.name,
+                    len(filtered),
+                    req,
+                    max_age_days,
+                )
+            if filtered:
+                candidates_list = filtered
+            elif age_fallback == AgeFallback.ALL:
+                logger.warning(
+                    "%s: all %d candidate(s) of %s are older than %d days, "
+                    "keeping all to avoid empty resolution",
+                    req.name,
+                    len(candidates_list),
+                    req,
+                    max_age_days,
+                )
+            elif age_fallback == AgeFallback.NEWEST:
+                newest = candidates_list[0]
+                logger.info(
+                    "%s: all %d candidate(s) of %s are older than %d days, "
+                    "falling back to newest version %s",
+                    req.name,
+                    len(candidates_list),
+                    req,
+                    max_age_days,
+                    newest.version,
+                )
+                candidates_list = [newest]
+            else:
+                logger.info(
+                    "%s: all %d candidate(s) of %s are older than %d days",
+                    req.name,
+                    len(candidates_list),
+                    req,
+                    max_age_days,
+                )
+                candidates_list = []
+
+    # Convert candidates to list of (url, version) tuples
+    # Candidates are sorted by version (highest first) by BaseProvider.find_matches()
+    # which calls sorted(candidates, key=attrgetter("version", "build_tag"), reverse=True)
+    return [(c.url, c.version) for c in candidates_list]
 
 
 def get_project_from_pypi(
@@ -195,7 +382,13 @@ def get_project_from_pypi(
     *,
     override_download_url: str | None = None,
 ) -> Candidates:
-    """Return candidates created from the project name and extras."""
+    """Fetch and filter package candidates from a PyPI-compatible server.
+
+    Filters the project's package list by: project status, filename
+    validity, package type (sdist/wheel), yanked status, Python version
+    compatibility, and platform tags. Can substitute
+    ``override_download_url`` into each candidate's URL.
+    """
     found_candidates: set[str] = set()
     ignored_candidates: set[str] = set()
     logger.debug("%s: getting available versions from %s", project, sdist_server_url)
@@ -207,6 +400,10 @@ def get_project_from_pypi(
     )
     try:
         package = client.get_project_page(project)
+    except pypi_simple.errors.NoSuchProjectError as e:
+        raise resolvelib.resolvers.ResolverException(
+            f"project {project} not found on {sdist_server_url}"
+        ) from e
     except Exception as e:
         logger.debug(
             "failed to fetch package index from %s: %s",
@@ -397,6 +594,7 @@ type VersionSource = typing.Callable[
 class BaseProvider(ExtrasProvider):
     resolver_cache: typing.ClassVar[ResolverCache] = {}
     provider_description: typing.ClassVar[str]
+    _cooldown_unsupported_warned: typing.ClassVar[set[str]] = set()
 
     def __init__(
         self,
@@ -404,11 +602,21 @@ class BaseProvider(ExtrasProvider):
         constraints: Constraints | None = None,
         req_type: RequirementType | None = None,
         use_resolver_cache: bool = True,
+        cooldown: Cooldown | None = None,
     ):
         super().__init__()
         self.constraints = constraints or Constraints()
         self.req_type = req_type
         self.use_cache_candidates = use_resolver_cache
+
+        # cooldown specific settings
+        self.cooldown = cooldown
+        # Does this provider supply upload timestamps for candidates?
+        # Defaults to False (safe/unknown). Subclasses that reliably populate
+        # upload_time on every candidate should set this to True in their __init__.
+        # When a cooldown is active and this is False, the cooldown check is
+        # skipped with a warning rather than failing closed.
+        self.supports_upload_time: bool = False
 
     @property
     def cache_key(self) -> str:
@@ -468,8 +676,8 @@ class BaseProvider(ExtrasProvider):
         incompatibilities: CandidatesMap,
         candidate: Candidate,
     ) -> bool:
-        identifier_reqs = list(requirements[identifier])
-        bad_versions = {c.version for c in incompatibilities[identifier]}
+        identifier_reqs = list(requirements.get(identifier, []))
+        bad_versions = {c.version for c in incompatibilities.get(identifier, [])}
         # Skip versions that are known bad
         if candidate.version in bad_versions:
             if DEBUG_RESOLVER:
@@ -520,6 +728,54 @@ class BaseProvider(ExtrasProvider):
             return False
 
         return True
+
+    def is_blocked_by_cooldown(self, candidate: Candidate) -> bool:
+        """Return True if the candidate is rejected by the release-age cooldown."""
+
+        # a cooldown is not specified...
+        if self.cooldown is None:
+            return False
+
+        # the target candidate doesn't provide a valid upload timestamp
+        if candidate.upload_time is None:
+            if not self.supports_upload_time:
+                # this provider does not yet support timestamp retrieval (e.g. GitHub).
+                # Warn once per package name across all provider instances.
+                if candidate.name not in BaseProvider._cooldown_unsupported_warned:
+                    BaseProvider._cooldown_unsupported_warned.add(candidate.name)
+                    logger.warning(
+                        "release-age cooldown cannot be enforced — upload "
+                        "timestamp support is not yet implemented for %s; "
+                        "cooldown check skipped",
+                        self.get_provider_description(),
+                    )
+                return False
+            # this provider is expected to supply timestamps,
+            # but this candidate is missing one.
+            # Fail closed: we cannot verify the age of this candidate, so reject it.
+            if DEBUG_RESOLVER:
+                logger.debug(
+                    "skipping %s — upload_time unknown, required for cooldown",
+                    candidate.version,
+                )
+            return True
+
+        # cooldowns are enabled, and this candidate has a valid upload timestamp
+        # so we can do the math to determine whether or not the candidate should
+        # be blocked/skipped
+        cutoff = self.cooldown.bootstrap_time - self.cooldown.min_age
+        if candidate.upload_time > cutoff:
+            # if this candidate is "too new", block/skip it
+            if DEBUG_RESOLVER:
+                age = self.cooldown.bootstrap_time - candidate.upload_time
+                logger.debug(
+                    "skipping %s uploaded %s ago (cooldown: %s)",
+                    candidate.version,
+                    age,
+                    self.cooldown.min_age,
+                )
+            return True
+        return False
 
     def get_dependencies(self, candidate: Candidate) -> list[Requirement]:
         # return candidate.dependencies
@@ -573,8 +829,11 @@ class BaseProvider(ExtrasProvider):
 
         Subclasses should override this to provide provider-specific error details.
         """
-        r = next(iter(requirements[identifier]))
-        return f"found no match for {r} using {self.get_provider_description()}"
+        reqs = requirements.get(identifier, [])
+        if reqs:
+            r = next(iter(reqs))
+            return f"found no match for {r} using {self.get_provider_description()}"
+        return f"found no match for identifier {identifier} using {self.get_provider_description()}"
 
     def find_matches(
         self,
@@ -591,6 +850,17 @@ class BaseProvider(ExtrasProvider):
                 identifier, requirements, incompatibilities, candidate
             )
         ]
+        # Apply cooldown filtering after specifier/constraint validation
+        blocked = [c for c in candidates if self.is_blocked_by_cooldown(c)]
+        if blocked:
+            for b in blocked:
+                candidates.remove(b)
+            versions = ", ".join(str(b.version) for b in blocked)
+            logger.info(
+                "cooldown blocked %d version(s): %s",
+                len(blocked),
+                versions,
+            )
         if not candidates:
             raise resolvelib.resolvers.ResolverException(
                 self._get_no_match_error_message(identifier, requirements)
@@ -620,12 +890,21 @@ class PyPIProvider(BaseProvider):
         *,
         use_resolver_cache: bool = True,
         override_download_url: str | None = None,
+        cooldown: Cooldown | None = None,
+        supports_upload_time: bool | None = None,
     ):
         super().__init__(
             constraints=constraints,
             req_type=req_type,
             use_resolver_cache=use_resolver_cache,
+            cooldown=cooldown,
         )
+
+        # Only pypi.org reliably supports PEP 691 upload timestamps.
+        # Default to True for pypi.org, False for all other indexes.
+        if supports_upload_time is None:
+            supports_upload_time = sdist_server_url.startswith(PYPI_SERVER_URL)
+        self.supports_upload_time = supports_upload_time
         self.include_sdists = include_sdists
         self.include_wheels = include_wheels
         self.sdist_server_url = sdist_server_url
@@ -699,6 +978,36 @@ class PyPIProvider(BaseProvider):
         else:
             file_type_info = "wheels"
 
+        # If a cooldown is active, check whether it's responsible for the
+        # failure so we can give a more actionable error message.
+        if self.cooldown is not None:
+            cutoff = self.cooldown.bootstrap_time - self.cooldown.min_age
+            all_candidates = list(self._find_cached_candidates(identifier))
+            missing_time = [c for c in all_candidates if c.upload_time is None]
+            cooldown_blocked = [
+                c
+                for c in all_candidates
+                if c.upload_time is not None and c.upload_time > cutoff
+            ]
+            if missing_time and not cooldown_blocked:
+                return (
+                    f"found {len(missing_time)} candidate(s) for {r} but none have "
+                    f"upload timestamp metadata; {self.sdist_server_url!r} may not "
+                    f"support PEP 691 (JSON API), which is required to enforce the "
+                    f"{self.cooldown.min_age.days}-day release-age cooldown"
+                )
+            if cooldown_blocked:
+                oldest_days = min(
+                    (self.cooldown.bootstrap_time - c.upload_time).days
+                    for c in cooldown_blocked
+                    if c.upload_time is not None
+                )
+                return (
+                    f"found {len(cooldown_blocked)} candidate(s) for {r} but all "
+                    f"were published within the last {self.cooldown.min_age.days} days "
+                    f"(release-age cooldown; oldest is {oldest_days} day(s) old)"
+                )
+
         return (
             f"found no match for {r} using {self.get_provider_description()}, "
             f"searching for {file_type_info}, {prerelease_info} pre-release versions"
@@ -730,11 +1039,13 @@ class GenericProvider(BaseProvider):
         *,
         # generic provider does not implement caching
         use_resolver_cache: bool = False,
+        cooldown: Cooldown | None = None,
     ):
         super().__init__(
             constraints=constraints,
             req_type=req_type,
             use_resolver_cache=use_resolver_cache,
+            cooldown=cooldown,
         )
         self._version_source = version_source
         if matcher is None:
@@ -776,6 +1087,13 @@ class GenericProvider(BaseProvider):
         raise NotImplementedError("GenericProvider does not implement caching")
 
     def find_candidates(self, identifier: typing.Any) -> Candidates:
+        """Find matching candidates from the version source.
+
+        Accepts three input formats from _version_source:
+        1. Candidate objects (used directly)
+        2. (url, Version) tuples
+        3. (url, str) tuples (version parsed via _match_function)
+        """
         candidates: list[Candidate] = []
         version: Version | None
         for item in self._version_source(identifier):
@@ -831,6 +1149,7 @@ class GitHubTagProvider(GenericProvider):
         req_type: RequirementType | None = None,
         use_resolver_cache: bool = True,
         override_download_url: str | None = None,
+        cooldown: Cooldown | None = None,
     ):
         super().__init__(
             constraints=constraints,
@@ -838,6 +1157,7 @@ class GitHubTagProvider(GenericProvider):
             use_resolver_cache=use_resolver_cache,
             version_source=self._find_tags,
             matcher=matcher,
+            cooldown=cooldown,
         )
         self.organization = organization
         self.repo = repo
@@ -861,13 +1181,7 @@ class GitHubTagProvider(GenericProvider):
         identifier: str,
     ) -> Iterable[Candidate]:
         headers = {"accept": "application/vnd.github+json"}
-
-        # Add GitHub authentication if available
-        github_token = os.environ.get("GITHUB_TOKEN")
-        if github_token:
-            headers["Authorization"] = f"token {github_token}"
-
-        nexturl = self.api_url.format(self=self)
+        nexturl: str | None = self.api_url.format(self=self)
         while nexturl:
             resp = session.get(nexturl, headers=headers)
             resp.raise_for_status()
@@ -930,6 +1244,7 @@ class GitLabTagProvider(GenericProvider):
         req_type: RequirementType | None = None,
         use_resolver_cache: bool = True,
         override_download_url: str | None = None,
+        cooldown: Cooldown | None = None,
     ) -> None:
         super().__init__(
             constraints=constraints,
@@ -937,7 +1252,9 @@ class GitLabTagProvider(GenericProvider):
             use_resolver_cache=use_resolver_cache,
             version_source=self._find_tags,
             matcher=matcher,
+            cooldown=cooldown,
         )
+        self.supports_upload_time = True
         self.server_url = server_url.rstrip("/")
         self.server_hostname = urlparse(server_url).hostname
         if not self.server_hostname:
@@ -971,7 +1288,7 @@ class GitLabTagProvider(GenericProvider):
         self,
         identifier: str,
     ) -> Iterable[Candidate]:
-        nexturl: str = self.api_url
+        nexturl: str | None = self.api_url
         created_at: datetime.datetime | None
         project_name = self.project_path.split("/")[-1]
         if self.override_download_url is None:
@@ -1040,12 +1357,14 @@ class VersionMapProvider(BaseProvider):
     def __init__(
         self,
         version_map: VersionMap,
-        package_name: str,
+        package_name: str | None,
         constraints: Constraints | None = None,
         *,
         req_type: RequirementType | None = None,
         use_resolver_cache: bool = True,
     ) -> None:
+        if package_name is None:
+            use_resolver_cache = False
         super().__init__(
             constraints=constraints,
             req_type=req_type,
@@ -1056,6 +1375,8 @@ class VersionMapProvider(BaseProvider):
 
     @property
     def cache_key(self) -> str:
+        if self.package_name is None:
+            raise ValueError("Cannot cache VersionMapProvider without package name")
         return f"versionmap:{self.package_name}"
 
     def find_candidates(self, identifier: str) -> Candidates:

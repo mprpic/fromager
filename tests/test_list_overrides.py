@@ -70,6 +70,7 @@ def test_list_overrides_details_table(
     assert "test-other-pkg" in result.stdout
     assert "test-pkg" in result.stdout
     assert "test-pkg-library" in result.stdout
+    assert "Min Release Age (days)" in result.stdout
 
 
 def test_list_overrides_details_json(
@@ -112,6 +113,7 @@ def test_list_overrides_details_json(
     assert "version" in first_item
     assert "patches" in first_item
     assert "plugin_hooks" in first_item
+    assert "min_release_age" in first_item
     assert "rocm" in first_item  # variant column
 
 
@@ -148,6 +150,7 @@ def test_list_overrides_details_csv(
     assert '"version"' in header
     assert '"patches"' in header
     assert '"plugin_hooks"' in header
+    assert '"min_release_age"' in header
     assert '"rocm"' in header  # variant column
 
     # Check data rows
@@ -200,38 +203,16 @@ def test_list_overrides_format_option_help(cli_runner: CliRunner) -> None:
     )
     assert result.exit_code == 0
     assert "--format [table|csv|json]" in result.stdout
-    assert "requires --details" in result.stdout
 
 
-def test_list_overrides_warnings_without_details(
-    testdata_path: pathlib.Path, cli_runner: CliRunner
+def test_list_overrides_output_file_plain(
+    testdata_path: pathlib.Path, cli_runner: CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Test that warnings are shown when using format/output without details."""
+    """--output writes plain name list to a file when --details is not used."""
     settings_file = testdata_path / "context" / "overrides" / "settings.yaml"
     patches_dir = testdata_path / "context" / "overrides" / "patches"
+    output_file = tmp_path / "overrides.txt"
 
-    # Test format warning
-    result = cli_runner.invoke(
-        fromager,
-        [
-            "--settings-file",
-            str(settings_file),
-            "--patches-dir",
-            str(patches_dir),
-            "list-overrides",
-            "--format",
-            "json",
-        ],
-        catch_exceptions=False,
-    )
-    assert result.exit_code == 0
-    assert (
-        "Warning: --format option is ignored when --details is not used"
-        in result.output
-    )
-    assert "test-other-pkg" in result.output
-
-    # Test output warning
     result = cli_runner.invoke(
         fromager,
         [
@@ -241,13 +222,56 @@ def test_list_overrides_warnings_without_details(
             str(patches_dir),
             "list-overrides",
             "--output",
-            "test.txt",
+            str(output_file),
         ],
-        catch_exceptions=False,
     )
     assert result.exit_code == 0
-    assert (
-        "Warning: --output option is ignored when --details is not used"
-        in result.output
+    assert output_file.exists()
+    content = output_file.read_text()
+    assert "test-other-pkg" in content
+    assert "test-pkg" in content
+    assert "test-pkg-library" in content
+    # stdout should be empty (no data printed to console)
+    assert "test-pkg" not in result.stdout
+    assert "test-other-pkg" not in result.stdout
+    assert "test-pkg-library" not in result.stdout
+
+
+def test_list_overrides_min_release_age(
+    testdata_path: pathlib.Path, cli_runner: CliRunner
+) -> None:
+    """Test that min_release_age per-package override appears in --details output."""
+    overrides_dir = testdata_path / "context" / "overrides"
+    settings_file = overrides_dir / "settings.yaml"
+    settings_dir = overrides_dir / "settings"
+    patches_dir = overrides_dir / "patches"
+
+    result = cli_runner.invoke(
+        fromager,
+        [
+            "--settings-file",
+            str(settings_file),
+            "--settings-dir",
+            str(settings_dir),
+            "--patches-dir",
+            str(patches_dir),
+            "list-overrides",
+            "--details",
+            "--format",
+            "json",
+        ],
     )
-    assert "test-other-pkg" in result.output
+    assert result.exit_code == 0
+
+    json_output = _extract_json_from_output(result.stdout)
+    data = json.loads(json_output)
+
+    # test-cooldown-pkg has resolver_dist.min_release_age: 7 in its settings YAML
+    test_cooldown_pkg = next(
+        item for item in data if item["package"] == "test-cooldown-pkg"
+    )
+    assert test_cooldown_pkg["min_release_age"] == "7"
+
+    # test-other-pkg has no min_release_age override — should be empty
+    test_other_pkg = next(item for item in data if item["package"] == "test-other-pkg")
+    assert test_other_pkg["min_release_age"] == ""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import re
 import typing
 from collections.abc import Mapping
 
@@ -12,21 +13,268 @@ import pydantic
 import yaml
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
-from pydantic import Field
+from pydantic import AnyUrl, Field, PrivateAttr, StringConstraints
 from pydantic_core import core_schema
 
+# from ._resolver import SourceResolver
 from ._typedefs import (
     MODEL_CONFIG,
     BuildDirectory,
     EnvVars,
     Package,
+    PurlType,
     RawAnnotations,
     Template,
+    UpstreamPurl,
     Variant,
     VariantChangelog,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class SbomSettings(pydantic.BaseModel):
+    """Global SBOM generation settings
+
+    ::
+
+      sbom:
+        supplier: "Organization: ExampleCo"
+        namespace: "https://www.example.com"
+        purl_type: pypi
+        repository_url: "https://example.com/simple"
+        creators:
+          - "Organization: ExampleCo"
+    """
+
+    model_config = MODEL_CONFIG
+
+    supplier: str = "NOASSERTION"
+    """SPDX supplier field for the wheel package (e.g. ``Organization: ExampleCo``)"""
+
+    namespace: AnyUrl = AnyUrl("https://spdx.org/spdxdocs")
+    """Base URL for the SPDX documentNamespace"""
+
+    creators: list[str] = Field(default_factory=list)
+    """Additional SPDX creator entries (e.g. ``Organization: ExampleCo``)
+
+    The fromager tool creator entry is always added automatically.
+    """
+
+    purl_type: PurlType = "pypi"
+    """Default purl type for all packages (e.g. ``pypi``, ``generic``)"""
+
+    repository_url: AnyUrl | None = None
+    """Default purl ``repository_url`` qualifier for all packages
+
+    When set, this URL is added to every purl as a qualifier
+    (e.g. ``pkg:pypi/flask@2.0?repository_url=https://example.com/simple``).
+    Can be overridden per-package in the package settings file.
+    """
+
+
+# Environment variable filter patterns for ExternalCommands.
+# Pattern: starts with letter or underscore, rest is letters/digits/underscores,
+# optionally ending with ``*`` (trailing wildcard).
+# DeleteEnvPattern additionally allows bare ``*`` (catch-all).
+KeepEnvPattern = typing.Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*\*?$"),
+]
+
+DeleteEnvPattern = typing.Annotated[
+    str,
+    StringConstraints(pattern=r"^(\*|[a-zA-Z_][a-zA-Z0-9_]*\*?)$"),
+]
+
+
+# POSIX.1-2024 sec. 8.1: environment variable names consist of uppercase
+# letters, digits, and underscores and do not begin with a digit.  We
+# also accept lowercase letters for portability (common on Linux).
+_POSIX_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _compile_env_patterns(
+    patterns: tuple[str, ...],
+    *,
+    case_insensitive: bool = False,
+) -> re.Pattern[str]:
+    """Compile env filter patterns into a single regex for ``fullmatch``.
+
+    Exact patterns (e.g. ``HOME``) become ``HOME`` and prefix patterns
+    (e.g. ``LC_*``) become ``LC_.*``.  The result is
+    ``HOME|LC_.*|...`` (used with ``fullmatch``).
+
+    *patterns* must be non-empty.
+    """
+    parts: list[str] = []
+    for p in patterns:
+        if p.endswith("*"):
+            parts.append(re.escape(p[:-1]) + ".*")
+        else:
+            parts.append(re.escape(p))
+    flags = re.IGNORECASE if case_insensitive else 0
+    return re.compile("|".join(parts), flags)
+
+
+class ExternalCommands(pydantic.BaseModel):
+    """Environment variable filtering for subprocesses.
+
+    Variables whose keys are not valid POSIX names are always removed.
+    A hard-coded set of variables required for basic subprocess
+    operation (see ``DEFAULT_KEEP_ENV``) is always kept.  User-supplied
+    ``keep_env`` patterns are evaluated before ``delete_env`` patterns.
+
+    ::
+
+      external_commands:
+        keep_env:
+          - "CARGO_*"
+        delete_env:
+          - "CI_TOKEN"
+          - "AWS_*"
+
+    .. versionadded:: 0.92.0
+    """
+
+    model_config = MODEL_CONFIG
+
+    DEFAULT_KEEP_ENV: typing.ClassVar[tuple[str, ...]] = (
+        "HOME",
+        "HOSTNAME",
+        "LANG",
+        "LANGUAGE",
+        "LC_*",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USER",
+    )
+    """Patterns always kept regardless of user configuration."""
+
+    keep_env: list[KeepEnvPattern] = Field(default_factory=list)
+    """Allowlist patterns (evaluated before ``delete_env``)"""
+
+    delete_env: list[DeleteEnvPattern] = Field(default_factory=list)
+    """Blocklist patterns (evaluated after ``keep_env``)"""
+
+    _keep_re: re.Pattern[str] | None = PrivateAttr(default=None)
+    _delete_re: re.Pattern[str] | None = PrivateAttr(default=None)
+
+    @pydantic.model_validator(mode="after")
+    def validate_delete_env(self) -> typing.Self:
+        """Validate ``delete_env`` for conflicts and redundancy."""
+        if not self.delete_env:
+            return self
+        if "*" in self.delete_env and len(self.delete_env) > 1:
+            raise ValueError(
+                "delete_env: bare '*' must be the only entry, "
+                "additional patterns are redundant"
+            )
+        # Exact string overlap check.  This catches obvious
+        # configuration mistakes (e.g. ``delete_env: [HOME]``) but does
+        # not detect all conflicts — for example ``delete_env: [LC_ALL]``
+        # is not flagged even though ``LC_ALL`` matches the default keep
+        # pattern ``LC_*``.
+        keep = set(self.DEFAULT_KEEP_ENV) | set(self.keep_env)
+        overlap = keep & set(self.delete_env)
+        if overlap:
+            raise ValueError(
+                f"delete_env overlaps with keep_env / DEFAULT_KEEP_ENV: "
+                f"{sorted(overlap)}"
+            )
+        return self
+
+    def model_post_init(self, __context: typing.Any) -> None:
+        """Pydantic post init hook to initialize internal data structures"""
+        if self.delete_env:
+            self._keep_re = _compile_env_patterns(
+                self.DEFAULT_KEEP_ENV + tuple(self.keep_env)
+            )
+            if "*" not in self.delete_env:
+                self._delete_re = _compile_env_patterns(
+                    tuple(self.delete_env), case_insensitive=True
+                )
+
+    def filter_env(self, env: Mapping[str, str]) -> Mapping[str, str]:
+        """Filter environment variables by keep/delete patterns.
+
+        Variables whose keys are not valid POSIX names are always
+        removed first.  Of the remaining variables, those matching
+        ``DEFAULT_KEEP_ENV`` or ``keep_env`` are always kept.  Of the
+        rest, those matching ``delete_env`` are removed.  Variables
+        matching neither list are kept.
+        """
+        # Remove keys that are not valid POSIX names, e.g. keys with
+        # dashes, dots, spaces, or bash function exports (BASH_FUNC_*%%).
+        env = {k: v for k, v in env.items() if _POSIX_ENV_KEY_RE.fullmatch(k)}
+        # _keep_re is only set in model_post_init when delete_env is
+        # non-empty, so None means no filtering is configured.
+        if self._keep_re is None:
+            return env
+        if self._delete_re is None:
+            # delete_env is ["*"]: keep only what matches
+            return {k: v for k, v in env.items() if self._keep_re.fullmatch(k)}
+        return {
+            k: v
+            for k, v in env.items()
+            if self._keep_re.fullmatch(k) or not self._delete_re.fullmatch(k)
+        }
+
+
+class PurlConfig(pydantic.BaseModel):
+    """Per-package purl configuration for SBOM generation.
+
+    Allows overriding individual purl components or specifying an
+    upstream purl for packages sourced from GitHub/GitLab.
+
+    .. versionadded:: 0.81.0
+
+    ::
+
+      purl:
+        type: generic
+        name: custom-name
+        repository_url: "https://example.com/simple"
+        upstream: "pkg:github/org/repo@v1.0.0"
+    """
+
+    model_config = MODEL_CONFIG
+
+    type: PurlType | None = None
+    """Override the purl type (e.g. ``generic`` instead of ``pypi``)"""
+
+    namespace: str | None = None
+    """Override the purl namespace component"""
+
+    name: str | None = None
+    """Override the purl name component (defaults to the package name)"""
+
+    version: str | None = None
+    """Override the purl version component (defaults to the resolved version)"""
+
+    repository_url: AnyUrl | None = None
+    """Per-package override for the purl ``repository_url`` qualifier.
+
+    Overrides the global ``sbom.repository_url`` setting for this package.
+    """
+
+    upstream: UpstreamPurl | None = None
+    """Full purl string identifying the upstream source package.
+
+    When set, this is used as the upstream identity in the SBOM's
+    GENERATED_FROM relationship. Used for packages sourced from
+    GitHub/GitLab rather than PyPI.
+
+    When absent, the upstream purl is auto-derived from the downstream
+    purl without the ``repository_url`` qualifier.
+    """
 
 
 class ResolverDist(pydantic.BaseModel):
@@ -67,6 +315,16 @@ class ResolverDist(pydantic.BaseModel):
     patches, plugins) don't use pypi.org metadata by default.
 
     .. versionadded:: 0.70
+    """
+
+    min_release_age: int | None = pydantic.Field(default=None, ge=0)
+    """Per-package minimum release age override in days.
+
+    None (default): inherit the global ``--min-release-age`` setting.
+    0: disable the release-age cooldown for this package.
+    Positive integer: override the cooldown with this many days.
+
+    .. versionadded:: 0.82
     """
 
     @pydantic.model_validator(mode="after")
@@ -201,7 +459,7 @@ class VariantInfo(pydantic.BaseModel):
         VAR1: "value 1"
         VAR2: "2.0
       wheel_server_url: https://pypi.org/simple/
-      pre_build: False
+      pre_built: False
     """
 
     model_config = MODEL_CONFIG
@@ -221,6 +479,10 @@ class VariantInfo(pydantic.BaseModel):
 
     pre_built: bool = False
     """Use pre-built wheel from index server?"""
+
+    # TODO
+    # source: SourceResolver | None
+    # """Source resolver and downloader"""
 
 
 class GitOptions(pydantic.BaseModel):
@@ -324,6 +586,16 @@ class PackageSettings(pydantic.BaseModel):
     download_source: DownloadSource = Field(default_factory=DownloadSource)
     """Alternative source download settings"""
 
+    purl: PurlConfig | None = None
+    """Purl configuration for SBOM generation.
+
+    A ``PurlConfig`` object with individual field overrides and upstream
+    source identification.
+
+    .. versionchanged:: 0.81.0
+       The *purl* option now requires a valid PURL config object instead of a string.
+    """
+
     resolver_dist: ResolverDist = Field(default_factory=ResolverDist)
     """Resolve distribution version"""
 
@@ -335,6 +607,10 @@ class PackageSettings(pydantic.BaseModel):
 
     project_override: ProjectOverride = Field(default_factory=ProjectOverride)
     """Patch project settings"""
+
+    # TODO
+    # source: SourceResolver | None
+    # """Source resolver and downloader"""
 
     variants: Mapping[Variant, VariantInfo] = Field(default_factory=dict)
     """Variant configuration"""

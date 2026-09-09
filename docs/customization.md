@@ -15,8 +15,10 @@ places use the normalized, *canonical name*.
 ```python
 import re
 
+
 def canonicalize_name(name: str) -> NormalizedName:
     return re.sub(r"[-_.]+", "-", name).lower()
+
 
 def override_name(name: str | NormalizedName) -> str:
     return canonicalize_name(name).replace("-", "_")
@@ -66,7 +68,7 @@ resolver_dist:
     include_wheels: true
     include_sdists: false
 git_options:
-    submodules: true  # Clone all submodules for git+https:// URLs
+    submodules: true  # Clone all submodules for git-based source providers
 build_dir: directory name relative to sdist directory, defaults to an empty string, which means to use the sdist directory
 env:
     USE_FFMPEG: "0"
@@ -90,7 +92,7 @@ source url can be provided directly in settings.yaml. Optionally the
 downloaded sdist can be renamed. Both the url and the destination filename
 support templating. The only supported template variable are:
 
-- `version` - it is replaced by the version returned by the `resolve_source`
+- `version` - it is replaced by the resolved version of the package
 - `canonicalized_name` - it is replaced by the canonicalized name of the
   package specified in the requirement, specifically it applies `canonicalize_name(req.nam)`
 
@@ -103,10 +105,10 @@ the package. Templating is not supported here.
 
 ### Git submodules
 
-When building packages from git repositories using `git+https://` URLs in your
-requirements, you can configure git submodule handling using the `git_options`
-settings. This is useful for packages that depend on external libraries included
-as git submodules.
+When using a git-based source provider (e.g. `pypi-git`, `github-tag-git`),
+you can configure git submodule handling using the `git_options` settings.
+This is useful for packages that depend on external libraries included as
+git submodules.
 
 #### Enabling all submodules
 
@@ -145,25 +147,6 @@ git_options:
   submodule_paths:          # Only these paths will be cloned
     - "vendor/lib1"
     - "vendor/lib2"
-```
-
-Git submodules are supported for packages specified as `git+https://` URLs in
-bootstrap requirements, such as:
-
-```text
-my-package @ git+https://github.com/example/repo.git@v1.2.3
-```
-
-Example requirements file with Git URLs:
-
-```{literalinclude} example/requirements-git-example.txt
-:caption: requirements-git-example.txt
-```
-
-A complete package configuration example:
-
-```{literalinclude} example/git-submodules-example.yaml
-:caption: git-submodules-example.yaml
 ```
 
 ### Build directory
@@ -262,16 +245,8 @@ dependency hooks (`get_build_backend_dependencies`,
 `get_build_sdist_dependencies`, etc.) that run *after* version
 resolution.
 
-It is **not** available:
-
-- During the `resolve` phase itself — the version has not yet been
-  determined.
-- When bootstrapping from a **git URL whose reference is not a valid
-  PEP 440 version** (for example
-  `pkg @ git+https://host/repo.git` or
-  `pkg @ git+https://host/repo.git@main`). In this case fromager
-  must build the package metadata just to discover the version, so
-  the early dependency-resolution hooks run with `version=None`.
+It is **not** available during the `resolve` phase itself — the
+version has not yet been determined.
 
 If your env var is used in a phase where the version might be
 unknown, add a fallback default so the substitution does not fail:
@@ -483,9 +458,7 @@ def prebuilt_wheel(
     dist_version: str,
     wheel_filename: pathlib.Path,
 ):
-    logger.info(
-        f"{req.name}: running prebuilt wheel hook for {wheel_filename}"
-    )
+    logger.info(f"{req.name}: running prebuilt wheel hook for {wheel_filename}")
 ```
 
 ### post_bootstrap
@@ -542,14 +515,14 @@ mycommand = "mypackage.module:mycommand"
 import click
 from fromager import context
 
+
 @click.command()
 @click.argument("example")
 @click.pass_obj
 def mycommand(
     wkctx: context.WorkContext,
     example: str,
-) -> None:
-    ...
+) -> None: ...
 ```
 
 ## See Also
@@ -563,7 +536,6 @@ def mycommand(
 **How-To Guides:**
 
 - [Override pyproject.toml](how-tos/pyproject-overrides.rst) - Modify build configuration
-- [Build from Git](how-tos/build-from-git-repo.rst) - Use custom source repositories
 - [Multiple Versions](how-tos/multiple-versions.rst) - Handle version conflicts
 
 **Concepts:**

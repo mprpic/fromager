@@ -3,26 +3,12 @@ import zipfile
 from unittest.mock import Mock, patch
 
 import pytest
-import wheel.wheelfile  # type: ignore
+from conftest import make_sbom_ctx
 from packaging.requirements import Requirement
 from packaging.version import Version
 
-from fromager import build_environment, context, sources, wheels
-
-
-@patch("fromager.sources.download_url")
-def test_invalid_wheel_file_exception(
-    mock_download_url: Mock, tmp_path: pathlib.Path
-) -> None:
-    mock_download_url.return_value = pathlib.Path(tmp_path / "test" / "fake_wheel.txt")
-    fake_url = "https://www.thisisafakeurl.com"
-    fake_dir = tmp_path / "test"
-    fake_dir.mkdir()
-    text_file = fake_dir / "fake_wheel.txt"
-    text_file.write_text("This is a test file")
-    req = Requirement("test_pkg")
-    with pytest.raises(wheel.wheelfile.WheelError):
-        wheels._download_wheel_check(req, fake_dir, fake_url)
+from fromager import build_environment, context, downloads, wheels
+from fromager.packagesettings import SbomSettings
 
 
 @patch("pyproject_hooks.BuildBackendHookCaller.build_wheel")
@@ -32,9 +18,12 @@ def test_default_build_wheel(
     testdata_context: context.WorkContext,
 ) -> None:
     req = Requirement("test_pkg")
+    sdist_root = tmp_path / "test_pkg-1.0"
+    sdist_root.mkdir()
     build_env = build_environment.BuildEnvironment(
         ctx=testdata_context,
-        parent_dir=tmp_path,
+        req=req,
+        sdist_root_dir=sdist_root,
     )
     pbi = testdata_context.package_build_info(req)
     assert pbi.config_settings
@@ -110,6 +99,100 @@ def test_add_extra_metadata_allows_legitimate_double_dots(
     mock_run.assert_called_once()
 
 
+def test_log_existing_sboms_when_present(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify that existing SBOM files in .dist-info/sboms/ are logged."""
+    req = Requirement("test_pkg==1.0.0")
+    dist_info_dir = tmp_path / "test_pkg-1.0.0.dist-info"
+    dist_info_dir.mkdir()
+    sboms_dir = dist_info_dir / "sboms"
+    sboms_dir.mkdir()
+    (sboms_dir / "cyclonedx.json").write_text("{}")
+    (sboms_dir / "other.spdx.json").write_text("{}")
+
+    with caplog.at_level("INFO", logger="fromager.wheels"):
+        wheels._log_existing_sboms(req, dist_info_dir)
+
+    assert "found existing SBOM files in wheel" in caplog.text
+    assert "cyclonedx.json" in caplog.text
+    assert "other.spdx.json" in caplog.text
+
+
+def test_log_existing_sboms_when_absent(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify no log output when .dist-info/sboms/ does not exist."""
+    req = Requirement("test_pkg==1.0.0")
+    dist_info_dir = tmp_path / "test_pkg-1.0.0.dist-info"
+    dist_info_dir.mkdir()
+
+    with caplog.at_level("INFO", logger="fromager.wheels"):
+        wheels._log_existing_sboms(req, dist_info_dir)
+
+    assert "SBOM" not in caplog.text
+
+
+@patch("fromager.external_commands.run")
+def test_add_extra_metadata_generates_sbom_when_enabled(
+    mock_run: Mock, tmp_path: pathlib.Path
+) -> None:
+    """Verify SBOM is generated in .dist-info/sboms/ when sbom settings are configured."""
+    sbom_ctx = make_sbom_ctx(tmp_path, sbom_settings=SbomSettings())
+    sbom_ctx.setup()
+    req = Requirement("test_pkg==1.0.0")
+    version = Version("1.0.0")
+
+    wheel_dir = tmp_path / "wheel_build"
+    wheel_dir.mkdir()
+    wheel_file = wheel_dir / "test_pkg-1.0.0-py3-none-any.whl"
+
+    with zipfile.ZipFile(wheel_file, "w") as zf:
+        zf.writestr("test_pkg/__init__.py", "")
+        zf.writestr(
+            "test_pkg-1.0.0.dist-info/METADATA",
+            "Name: test_pkg\nVersion: 1.0.0\n",
+        )
+        zf.writestr(
+            "test_pkg-1.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+
+    mock_run.return_value = ""
+
+    # Create the repacked wheel that wheel pack would produce
+    repacked = wheel_dir / "test_pkg-1.0.0-0-py3-none-any.whl"
+
+    sdist_dir = tmp_path / "sdist"
+    sdist_dir.mkdir()
+
+    # Capture the wheel contents before repack by inspecting what wheel pack receives
+    captured_contents: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        # wheel pack is called with the unpacked dir as second arg
+        unpacked_dir = pathlib.Path(cmd[2])
+        for f in unpacked_dir.rglob("*"):
+            if f.is_file():
+                captured_contents.append(str(f.relative_to(unpacked_dir)))
+        repacked.touch()
+        return ""
+
+    mock_run.side_effect = fake_run
+
+    wheels.add_extra_metadata_to_wheels(
+        ctx=sbom_ctx,
+        req=req,
+        version=version,
+        extra_environ={},
+        sdist_root_dir=sdist_dir,
+        wheel_file=wheel_file,
+    )
+
+    # Verify the SBOM file was added to the unpacked wheel before repacking
+    assert any("sboms/fromager.spdx.json" in c for c in captured_contents)
+
+
 def test_download_wheel_unquotes_url_encoded_filenames(tmp_path: pathlib.Path) -> None:
     """Test that download_wheel properly unquotes URL-encoded characters in filenames."""
     req = Requirement("test_pkg")
@@ -151,9 +234,8 @@ def test_download_wheel_unquotes_url_encoded_filenames(tmp_path: pathlib.Path) -
         assert result_filename == expected_filename
 
 
-def test_sources_download_url_unquotes_filenames(tmp_path: pathlib.Path) -> None:
-    """Test that sources.download_url properly unquotes URL-encoded characters in filenames."""
-    req = Requirement("test_pkg")
+def test_download_url_unquotes_filenames(tmp_path: pathlib.Path) -> None:
+    """Test that downloads.download_url properly unquotes URL-encoded characters in filenames."""
     # URL with encoded plus sign (%2B)
     url = "https://example.test/test_pkg-1.0%2Blocal.tar.gz"
 
@@ -164,9 +246,7 @@ def test_sources_download_url_unquotes_filenames(tmp_path: pathlib.Path) -> None
         mock_response.iter_content.return_value = [b"test content"]
         mock_get.return_value.__enter__.return_value = mock_response
 
-        result_filename = sources.download_url(
-            req=req, destination_dir=tmp_path, url=url
-        )
+        result_filename = downloads.download_url(destination_dir=tmp_path, url=url)
 
         # The filename should be unquoted, containing actual + character
         expected_filename = tmp_path / "test_pkg-1.0+local.tar.gz"

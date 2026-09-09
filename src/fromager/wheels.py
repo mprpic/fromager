@@ -12,26 +12,26 @@ import zipfile
 
 import elfdeps
 import tomlkit
-import wheel.wheelfile  # type: ignore
 from packaging.requirements import Requirement
 from packaging.tags import Tag
 from packaging.utils import (
     BuildTag,
-    canonicalize_name,
     parse_wheel_filename,
 )
 from packaging.version import Version
 
 from . import (
     dependencies,
+    downloads,
     external_commands,
     metrics,
     overrides,
     packagesettings,
     requirements_file,
     resolver,
-    sources,
+    sbom,
 )
+from .pkgmetadata.pep376 import verbatim_dist_name
 
 if typing.TYPE_CHECKING:
     from . import build_environment, context
@@ -42,6 +42,24 @@ FROMAGER_BUILD_SETTINGS = "fromager-build-settings"
 FROMAGER_ELF_PROVIDES = "fromager-elf-provides.txt"
 FROMAGER_ELF_REQUIRES = "fromager-elf-requires.txt"
 FROMAGER_BUILD_REQ_PREFIX = "fromager"
+
+
+def _log_existing_sboms(
+    req: Requirement,
+    dist_info_dir: pathlib.Path,
+) -> None:
+    """Log any existing SBOM files found in the wheel's .dist-info/sboms/ directory."""
+    sboms_dir = dist_info_dir / "sboms"
+    if not sboms_dir.is_dir():
+        return
+    sbom_files = sorted(sboms_dir.iterdir())
+    if sbom_files:
+        names = [f.name for f in sbom_files]
+        logger.info(
+            "%s: found existing SBOM files in wheel: %s",
+            req.name,
+            ", ".join(names),
+        )
 
 
 def _extra_metadata_elfdeps(
@@ -120,17 +138,15 @@ def _extra_metadata_elfdeps(
 def extract_info_from_wheel_file(
     req: Requirement, wheel_file: pathlib.Path
 ) -> tuple[str, Version, BuildTag, frozenset[Tag]]:
-    # parse_wheel_filename normalizes the dist name, however the dist-info
-    # directory uses the verbatim distribution name from the wheel file.
-    # Packages with upper case names like "MarkupSafe" are affected.
-    dist_name_normalized, dist_version, build_tag, wheel_tags = parse_wheel_filename(
-        wheel_file.name
-    )
-    dist_name = wheel_file.name.split("-", 1)[0]
-    if dist_name_normalized != canonicalize_name(dist_name):
-        # sanity check, should never fail
-        raise ValueError(f"{dist_name_normalized} does not match {dist_name}")
-    return (dist_name, dist_version, build_tag, wheel_tags)
+    """Extract metadata from a wheel filename.
+
+    Returns the **verbatim** dist name (not normalized) because the
+    dist-info directory inside the wheel uses the original casing
+    (e.g. ``MarkupSafe``, not ``markupsafe``).
+    """
+    _, version, build_tag, wheel_tags = parse_wheel_filename(wheel_file.name)
+    dist_name = verbatim_dist_name(wheel_file.name)
+    return (dist_name, version, build_tag, wheel_tags)
 
 
 def default_add_extra_metadata_to_wheels(
@@ -155,6 +171,12 @@ def add_extra_metadata_to_wheels(
     sdist_root_dir: pathlib.Path,
     wheel_file: pathlib.Path,
 ) -> pathlib.Path:
+    """Unpack a wheel, inject extra metadata, and repack with a build tag.
+
+    Unpacks the wheel, validates dist-info, adds plugin metadata, build
+    settings, requirement files, ELF dependency info (Linux only), and
+    an SBOM. Repacks with ``wheel pack`` and deletes the original.
+    """
     pbi = ctx.package_build_info(req)
     dist_name, dist_version, _, wheel_tags = extract_info_from_wheel_file(
         req, wheel_file
@@ -181,6 +203,8 @@ def add_extra_metadata_to_wheels(
         dist_info_dir = wheel_root_dir / f"{dist_filename}.dist-info"
         if not dist_info_dir.is_dir():
             raise ValueError(f"{wheel_file} does not contain {dist_info_dir.name}")
+
+        _log_existing_sboms(req, dist_info_dir)
 
         data_to_add = overrides.find_and_invoke(
             req.name,
@@ -230,6 +254,15 @@ def add_extra_metadata_to_wheels(
                 )
         else:
             logger.debug("%s is a purelib wheel", req.name)
+
+        sbom_settings = ctx.settings.sbom_settings
+        if sbom_settings is not None:
+            sbom_doc = sbom.generate_sbom(
+                ctx=ctx,
+                req=req,
+                version=version,
+            )
+            sbom.write_sbom(sbom=sbom_doc, dist_info_dir=dist_info_dir)
 
         build_tag_from_settings = pbi.build_tag(version)
         build_tag = build_tag_from_settings if build_tag_from_settings else (0, "")
@@ -411,27 +444,17 @@ def download_wheel(
     wheel_url: str,
     output_directory: pathlib.Path,
 ) -> pathlib.Path:
-    wheel_filename = output_directory / resolver.extract_filename_from_url(wheel_url)
+    wheel_filename = output_directory / downloads.extract_filename_from_url(wheel_url)
     if not wheel_filename.exists():
         logger.info(f"downloading pre-built wheel {wheel_url}")
-        wheel_filename = _download_wheel_check(req, output_directory, wheel_url)
+        wheel_filename = downloads.download_wheel(
+            destination_dir=output_directory,
+            url=wheel_url,
+        )
         logger.info(f"saved wheel to {wheel_filename}")
     else:
         logger.info(f"have existing wheel {wheel_filename}")
 
-    return wheel_filename
-
-
-def _download_wheel_check(
-    req: Requirement, destination_dir: pathlib.Path, wheel_url: str
-) -> pathlib.Path:
-    wheel_filename = sources.download_url(
-        req=req,
-        destination_dir=destination_dir,
-        url=wheel_url,
-    )
-    # validates whether the wheel is correct or not. will raise an error in the wheel is invalid
-    wheel.wheelfile.WheelFile(wheel_filename)
     return wheel_filename
 
 
@@ -455,6 +478,79 @@ def get_wheel_server_urls(
     return wheel_server_urls
 
 
+def get_prebuilt_wheel_provider(
+    *,
+    ctx: context.WorkContext,
+    req: Requirement,
+    wheel_server_url: str,
+    req_type: requirements_file.RequirementType | None = None,
+) -> resolver.BaseProvider:
+    """Create a provider for resolving prebuilt wheels from a wheel server.
+
+    Returns a provider configured to search for wheels (not sdists) that match
+    the current platform.
+    """
+    return typing.cast(
+        resolver.BaseProvider,
+        overrides.find_and_invoke(
+            req.name,
+            "get_resolver_provider",
+            resolver.default_resolver_provider,
+            ctx=ctx,
+            req=req,
+            include_sdists=False,
+            include_wheels=True,
+            sdist_server_url=wheel_server_url,
+            req_type=req_type,
+            # pre-built wheels must match platform
+            ignore_platform=False,
+        ),
+    )
+
+
+def resolve_all_prebuilt_wheels(
+    *,
+    ctx: context.WorkContext,
+    req: Requirement,
+    wheel_server_urls: list[str],
+    req_type: requirements_file.RequirementType | None = None,
+) -> list[tuple[str, Version]]:
+    """Return all matching wheel versions from the first successful server.
+
+    Tries wheel servers in order and returns all matching versions from the
+    first server that has any matches. Results are sorted by version (highest first).
+
+    Raises ExceptionGroup if no server has matching wheels.
+    """
+    excs: list[Exception] = []
+    for url in wheel_server_urls:
+        try:
+            # Get provider for this wheel server
+            provider = get_prebuilt_wheel_provider(
+                ctx=ctx, req=req, wheel_server_url=url, req_type=req_type
+            )
+            provider.cooldown = resolver.resolve_package_cooldown(
+                ctx, req, req_type=req_type
+            )
+            # The local fromager wheel server is PEP 503-only and serves
+            # packages that were already resolved and vetted earlier in the
+            # same run. Don't fail-closed on missing upload_time there.
+            if ctx.wheel_server_url and url == ctx.wheel_server_url:
+                provider.supports_upload_time = False
+
+            # Get all matching candidates from provider
+            results = resolver.find_all_matching_from_provider(provider, req)
+            # find_all_matching_from_provider never returns empty list - raises instead
+            return results
+        except Exception as e:
+            excs.append(e)
+
+    raise ExceptionGroup(
+        f"Could not find a prebuilt wheel for {req} on {' or '.join(wheel_server_urls)}",
+        excs,
+    )
+
+
 @metrics.timeit(description="resolve wheel")
 def resolve_prebuilt_wheel(
     *,
@@ -463,32 +559,14 @@ def resolve_prebuilt_wheel(
     wheel_server_urls: list[str],
     req_type: requirements_file.RequirementType | None = None,
 ) -> tuple[str, Version]:
-    "Return URL to wheel and its version."
-    excs: list[Exception] = []
-    for url in wheel_server_urls:
-        try:
-            wheel_url, resolved_version = resolver.resolve(
-                ctx=ctx,
-                req=req,
-                sdist_server_url=url,
-                include_sdists=False,
-                include_wheels=True,
-                req_type=req_type,
-                # pre-built wheels must match platform
-                ignore_platform=False,
-            )
-        except Exception as e:
-            excs.append(e)
-        else:
-            if wheel_url and resolved_version:
-                return (wheel_url, resolved_version)
-            else:
-                excs.append(
-                    ValueError(
-                        f"no result for {url}: {wheel_url=}, {resolved_version=}"
-                    )
-                )
-    raise ExceptionGroup(
-        f"Could not find a prebuilt wheel for {req} on {' or '.join(wheel_server_urls)}",
-        excs,
+    """Return (URL, version) for the best matching wheel version.
+
+    Tries wheel servers in order and returns result from the first that succeeds.
+    Returns the highest matching version.
+    """
+    results = resolve_all_prebuilt_wheels(
+        ctx=ctx, req=req, wheel_server_urls=wheel_server_urls, req_type=req_type
     )
+    # Return highest version (first in sorted list)
+    wheel_url, version = results[0]
+    return str(wheel_url), version

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import datetime
 import logging
 import pathlib
 import sys
@@ -7,6 +8,7 @@ import sys
 import click
 
 from . import (
+    candidate,
     clickext,
     commands,
     context,
@@ -66,18 +68,27 @@ else:
     help="save error messages to a file",
 )
 @click.option(
+    "-O",
+    "--output-dir",
+    default=pathlib.Path("."),
+    type=clickext.ClickPath(),
+    help="base directory for sdists-repo, wheels-repo, and work-dir (default: current directory)",
+)
+@click.option(
     "-o",
     "--sdists-repo",
-    default=pathlib.Path("sdists-repo"),
+    default=None,
     type=clickext.ClickPath(),
-    help="location to manage source distributions",
+    hidden=True,
+    help="location to manage source distributions (overrides --output-dir)",
 )
 @click.option(
     "-w",
     "--wheels-repo",
-    default=pathlib.Path("wheels-repo"),
+    default=None,
     type=clickext.ClickPath(),
-    help="location to manage wheel repository",
+    hidden=True,
+    help="location to manage wheel repository (overrides --output-dir)",
 )
 @click.option(
     "--build-wheel-server-url",
@@ -86,9 +97,10 @@ else:
 @click.option(
     "-t",
     "--work-dir",
-    default=pathlib.Path("work-dir"),
+    default=None,
     type=clickext.ClickPath(),
-    help="location to manage working files, including builds and logs",
+    hidden=True,
+    help="location to manage working files, including builds and logs (overrides --output-dir)",
 )
 @click.option(
     "-p",
@@ -121,8 +133,13 @@ else:
 @click.option(
     "-c",
     "--constraints-file",
+    "constraints_files",
+    multiple=True,
     type=str,
-    help="location of the constraints file",
+    help=(
+        "location of the constraints files. Constraints are merged and "
+        "checked for conflicts. Supports local path and remote from https://"
+    ),
 )
 @click.option(
     "--cleanup/--no-cleanup",
@@ -143,6 +160,12 @@ else:
     help="Build sdist and when with network isolation (unshare -cn)",
     show_default=True,
 )
+@click.option(
+    "--min-release-age",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Reject package versions published fewer than this many days ago (0 disables the check).",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -151,22 +174,33 @@ def main(
     log_file: pathlib.Path,
     log_format: str,
     error_log_file: pathlib.Path,
-    sdists_repo: pathlib.Path,
-    wheels_repo: pathlib.Path,
+    output_dir: pathlib.Path,
+    sdists_repo: pathlib.Path | None,
+    wheels_repo: pathlib.Path | None,
     build_wheel_server_url: str,
-    work_dir: pathlib.Path,
+    work_dir: pathlib.Path | None,
     patches_dir: pathlib.Path,
     settings_file: pathlib.Path,
     settings_dir: pathlib.Path,
-    constraints_file: str,
+    constraints_files: tuple[str, ...],
     cleanup: bool,
     variant: str,
     jobs: int | None,
     network_isolation: bool,
+    min_release_age: int,
 ) -> None:
     # Save the debug flag so invoke_main() can use it.
     global _DEBUG
     _DEBUG = debug
+
+    # Resolve output directories: explicit per-directory flags take
+    # precedence, otherwise derive from --output-dir.
+    if not sdists_repo:
+        sdists_repo = output_dir / "sdists-repo"
+    if not wheels_repo:
+        wheels_repo = output_dir / "wheels-repo"
+    if not work_dir:
+        work_dir = output_dir / "work-dir"
 
     # Set custom log factory to prepend requirement name.
     logging.setLogRecordFactory(log.FromagerLogRecord)
@@ -218,7 +252,7 @@ def main(
             logger.info(f"variant: {variant}")
             logger.info(f"patches dir: {patches_dir}")
             logger.info(f"maximum concurrent jobs: {jobs}")
-            logger.info(f"constraints file: {constraints_file}")
+            logger.info(f"constraints files: {', '.join(constraints_files)}")
             logger.info(f"network isolation: {network_isolation}")
             if build_wheel_server_url:
                 logger.info(f"external build wheel server: {build_wheel_server_url}")
@@ -238,7 +272,7 @@ def main(
             variant=variant,
             max_jobs=jobs,
         ),
-        constraints_file=constraints_file,
+        constraints_files=constraints_files,
         patches_dir=patches_dir,
         sdists_repo=sdists_repo,
         wheels_repo=wheels_repo,
@@ -249,6 +283,11 @@ def main(
         network_isolation=network_isolation,
         max_jobs=jobs,
         settings_dir=settings_dir,
+        cooldown=(
+            candidate.Cooldown(min_age=datetime.timedelta(days=min_release_age))
+            if min_release_age > 0
+            else None
+        ),
     )
     wkctx.setup()
     ctx.obj = wkctx

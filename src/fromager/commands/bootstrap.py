@@ -20,7 +20,7 @@ from .. import (
     resolver,
     server,
 )
-from ..log import requirement_ctxvar
+from ..bootstrapper import Bootstrapper
 from .build import build_parallel
 from .graph import find_why, show_explain_duplicates
 
@@ -103,6 +103,28 @@ def _get_requirements_from_args(
     default=False,
     help="Test mode: continue processing after failures, report failures at end",
 )
+@click.option(
+    "--multiple-versions",
+    "multiple_versions",
+    is_flag=True,
+    default=False,
+    help="Bootstrap all matching versions instead of only the highest version",
+)
+@click.option(
+    "--max-release-age",
+    "max_release_age",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Reject package versions published more than this many days ago.",
+)
+@click.option(
+    "--bg-threads",
+    "num_bg_threads",
+    type=click.IntRange(min=1),
+    default=Bootstrapper.DEFAULT_BG_THREADS,
+    show_default=True,
+    help="Number of background threads for parallel I/O pre-fetching (min 1).",
+)
 @click.argument("toplevel", nargs=-1)
 @click.pass_obj
 def bootstrap(
@@ -113,6 +135,9 @@ def bootstrap(
     sdist_only: bool,
     skip_constraints: bool,
     test_mode: bool,
+    multiple_versions: bool,
+    max_release_age: int | None,
+    num_bg_threads: int,
     toplevel: list[str],
 ) -> None:
     """Compute and build the dependencies of a set of requirements recursively
@@ -120,6 +145,8 @@ def bootstrap(
     TOPLEVEL is a requirements specification, including a package name
     and optional version constraints.
 
+    .. versionadded:: 0.89.0
+       ``--bg-threads`` option for parallel I/O pre-fetching.
     """
     logger.info(f"cache wheel server url: {cache_wheel_server_url}")
 
@@ -147,6 +174,26 @@ def bootstrap(
             "test mode enabled: will continue processing after failures and report at end"
         )
 
+    if multiple_versions:
+        logger.info(
+            "multiple versions mode enabled: will bootstrap all matching versions"
+        )
+        # Automatically disable constraints when multiple versions mode is enabled
+        # because constraints.txt cannot handle multiple versions of the same package
+        if not skip_constraints:
+            logger.info(
+                "automatically disabling constraints generation "
+                "(incompatible with --multiple-versions)"
+            )
+            skip_constraints = True
+
+    if max_release_age is not None:
+        wkctx.set_max_release_age(max_release_age)
+        logger.info(
+            "max release age: rejecting versions older than %d days",
+            max_release_age,
+        )
+
     pre_built = wkctx.settings.list_pre_built()
     if pre_built:
         logger.info("treating %s as pre-built wheels", sorted(pre_built))
@@ -154,42 +201,26 @@ def bootstrap(
     server.start_wheel_server(wkctx)
 
     with progress.progress_context(total=len(to_build * 2)) as progressbar:
-        bt = bootstrapper.Bootstrapper(
+        with bootstrapper.Bootstrapper(
             wkctx,
             progressbar,
             prev_graph,
             cache_wheel_server_url,
             sdist_only=sdist_only,
             test_mode=test_mode,
-        )
+            multiple_versions=multiple_versions,
+            num_bg_threads=num_bg_threads,
+        ) as bt:
+            # Resolve and bootstrap all top-level dependencies and their transitive
+            # dependencies. Context management and error handling are handled internally
+            # by Bootstrapper.bootstrap().
+            logger.info("resolving and bootstrapping top-level dependencies")
+            bt.bootstrap(list(to_build))
 
-        # Pre-resolution phase: Resolve all top-level dependencies before recursive
-        # bootstrapping begins. Test-mode error handling is in Bootstrapper.
-        # Note: We don't use try/finally here because:
-        # - In test-mode: exceptions are caught inside resolve_and_add_top_level()
-        # - In normal mode: exceptions should propagate with context preserved for logging
-        logger.info("resolving top-level dependencies before building")
-        resolved_reqs: list[Requirement] = []
-        for req in to_build:
-            token = requirement_ctxvar.set(req)
-            result = bt.resolve_and_add_top_level(req)
-            if result is not None:
-                resolved_reqs.append(req)
-            # If result is None, test_mode recorded the failure and we continue
-            requirement_ctxvar.reset(token)
-
-        # Bootstrap only packages that were successfully resolved
-        # Note: Same pattern - no try/finally to preserve context for error logging
-        for req in resolved_reqs:
-            token = requirement_ctxvar.set(req)
-            bt.bootstrap(req, requirements_file.RequirementType.TOP_LEVEL)
-            progressbar.update()
-            requirement_ctxvar.reset(token)
-
-        # Finalize test mode and check for failures
-        exit_code = bt.finalize()
-        if exit_code != 0:
-            raise SystemExit(exit_code)
+            # Finalize test mode and check for failures
+            exit_code = bt.finalize()
+            if exit_code != 0:
+                raise SystemExit(exit_code)
 
     constraints_filename = wkctx.work_dir / "constraints.txt"
     if skip_constraints:
@@ -463,6 +494,28 @@ bootstrap._fromager_show_build_settings = True  # type: ignore
     default=None,
     help="maximum number of parallel workers to run (default: unlimited)",
 )
+@click.option(
+    "--multiple-versions",
+    "multiple_versions",
+    is_flag=True,
+    default=False,
+    help="Bootstrap all matching versions instead of only the highest version",
+)
+@click.option(
+    "--max-release-age",
+    "max_release_age",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Reject package versions published more than this many days ago.",
+)
+@click.option(
+    "--bg-threads",
+    "num_bg_threads",
+    type=click.IntRange(min=1),
+    default=Bootstrapper.DEFAULT_BG_THREADS,
+    show_default=True,
+    help="Number of background threads for parallel I/O pre-fetching (min 1).",
+)
 @click.argument("toplevel", nargs=-1)
 @click.pass_obj
 @click.pass_context
@@ -476,6 +529,9 @@ def bootstrap_parallel(
     skip_constraints: bool,
     force: bool,
     max_workers: int | None,
+    multiple_versions: bool,
+    max_release_age: int | None,
+    num_bg_threads: int,
     toplevel: list[str],
 ) -> None:
     """Bootstrap and build-parallel
@@ -502,6 +558,9 @@ def bootstrap_parallel(
         cache_wheel_server_url=cache_wheel_server_url,
         sdist_only=True,
         skip_constraints=skip_constraints,
+        multiple_versions=multiple_versions,
+        max_release_age=max_release_age,
+        num_bg_threads=num_bg_threads,
         toplevel=toplevel,
     )
 

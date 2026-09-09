@@ -13,11 +13,12 @@ import psutil
 from packaging.utils import BuildTag, NormalizedName
 from packaging.version import Version
 
-from .. import overrides
+from .. import overrides, threading_utils
 from ._models import (
     GitOptions,
     PackageSettings,
     ProjectOverride,
+    PurlConfig,
     VariantInfo,
 )
 from ._templates import _resolve_template, substitute_template
@@ -28,14 +29,6 @@ if typing.TYPE_CHECKING:
     from ._settings import Settings
 
 logger = logging.getLogger(__name__)
-
-
-def get_cpu_count() -> int:
-    """CPU count from scheduler affinity"""
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    else:
-        return os.cpu_count() or 1
 
 
 def get_available_memory_gib() -> float:
@@ -55,7 +48,7 @@ class PackageBuildInfo:
         self._variant_changelog = settings.variant_changelog()
         self._max_jobs: int | None = settings.max_jobs
         self._ps = ps
-        self._plugin_module: types.ModuleType | None | typing.Literal[False] = False
+        self._plugin_module: types.ModuleType | typing.Literal[False] | None = False
         self._patches: PatchMap | None = None
         self._annotations: Annotations | None = None
 
@@ -68,6 +61,11 @@ class PackageBuildInfo:
     def variant(self) -> Variant:
         """Variant name"""
         return self._variant
+
+    @property
+    def purl_config(self) -> PurlConfig | None:
+        """Per-package purl configuration for SBOM generation."""
+        return self._ps.purl
 
     @property
     def annotations(self) -> Annotations:
@@ -246,6 +244,16 @@ class PackageBuildInfo:
         return self._ps.resolver_dist.ignore_platform
 
     @property
+    def resolver_min_release_age(self) -> int | None:
+        """Per-package release-age cooldown override in days.
+
+        Returns None (inherit global), 0 (disabled), or a positive integer
+        (override days). The caller is responsible for converting to a
+        :class:`~fromager.candidate.Cooldown` instance.
+        """
+        return self._ps.resolver_dist.min_release_age
+
+    @property
     def use_pypi_org_metadata(self) -> bool:
         """Can use metadata from pypi.org JSON / Simple API?
 
@@ -362,7 +370,7 @@ class PackageBuildInfo:
         """How many parallel jobs?"""
         # adjust by CPU cores, at least 1
         cpu_cores_per_job = self._ps.build_options.cpu_cores_per_job
-        cpu_count = get_cpu_count()
+        cpu_count = threading_utils.get_cpu_count()
         max_num_job_cores = int(max(1, cpu_count // cpu_cores_per_job))
         logger.debug(
             f"{self.package}: {max_num_job_cores=}, {cpu_cores_per_job=}, {cpu_count=}"

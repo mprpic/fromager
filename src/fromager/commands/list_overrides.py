@@ -5,10 +5,13 @@ import sys
 
 import click
 import rich
+import rich.console
 from packaging.version import Version
 from rich.table import Table
 
 from fromager import clickext, context
+from fromager.hooks import GLOBAL_HOOK_NAMES
+from fromager.overrides import OVERRIDE_HOOK_NAMES
 from fromager.packagesettings import PatchMap
 
 
@@ -24,13 +27,13 @@ from fromager.packagesettings import PatchMap
     "output_format",
     type=click.Choice(["table", "csv", "json"], case_sensitive=False),
     default="table",
-    help="Output format for detailed view (requires --details, default: table)",
+    help="Output format for detailed view (used with --details, default: table)",
 )
 @click.option(
     "-o",
     "--output",
     type=clickext.ClickPath(),
-    help="Output file to create (requires --details, default: stdout)",
+    help="Write output to file instead of stdout",
 )
 @click.pass_obj
 def list_overrides(
@@ -40,29 +43,18 @@ def list_overrides(
     output: pathlib.Path | None,
 ) -> None:
     """List all of the packages with overrides in the current configuration."""
-    # Warn if format/output options are used without --details
-    if not details:
-        if output_format != "table":
-            click.echo(
-                "Warning: --format option is ignored when --details is not used",
-                err=True,
-            )
-        if output is not None:
-            click.echo(
-                "Warning: --output option is ignored when --details is not used",
-                err=True,
-            )
-
     overridden_packages = sorted(wkctx.settings.list_overrides())
     if not details:
-        for name in overridden_packages:
-            print(name)
+        with clickext.output_file_or_stdout(output) as fh:
+            for name in overridden_packages:
+                print(name, file=fh)
         return
 
     # Collect data for export
     variants = sorted(wkctx.settings.all_variants())
     variant_names = [str(v) for v in variants]
     export_data = []
+    all_hook_names = GLOBAL_HOOK_NAMES + OVERRIDE_HOOK_NAMES
 
     for name in overridden_packages:
         pbi = wkctx.settings.package_build_info(name)
@@ -70,25 +62,7 @@ def list_overrides(
 
         plugin_hooks: list[str] = []
         if pbi.plugin:
-            for hook in [
-                # from hooks.py
-                "post_build",
-                "post_bootstrap",
-                "prebuilt_wheel",
-                # from overrides.py, found by searching for find_override_method
-                "download_source",
-                "resolve_source",
-                "get_resolver_provider",
-                "prepare_source",
-                "build_sdist",
-                "build_wheel",
-                "get_build_requirements",
-                "get_build_sdist_requirements",
-                "get_build_wheel_requirements",
-                "expected_source_archive_name",
-                "expected_source_directory_name",
-                "add_extra_metadata_to_wheels",
-            ]:
+            for hook in all_hook_names:
                 if hasattr(pbi.plugin, hook):
                     plugin_hooks.append(hook)
         plugin_hooks_str = ", ".join(plugin_hooks)
@@ -112,6 +86,11 @@ def list_overrides(
             [v for v in all_patches.keys() if v is not None]
         )
 
+        min_release_age = ps.resolver_dist.min_release_age
+        min_release_age_str = (
+            str(min_release_age) if min_release_age is not None else ""
+        )
+
         if not all_pkg_versions:
             # This package has overrides, but none are version-specific.
             patches_str = str(num_global_patches) if num_global_patches else ""
@@ -120,6 +99,7 @@ def list_overrides(
                 "version": "",
                 "patches": patches_str,
                 "plugin_hooks": plugin_hooks_str,
+                "min_release_age": min_release_age_str,
             }
             # Add variant information
             row_data.update(variant_info)
@@ -136,6 +116,7 @@ def list_overrides(
                     "version": str(version),
                     "patches": patches_str,
                     "plugin_hooks": plugin_hooks_str,
+                    "min_release_age": min_release_age_str,
                 }
                 # Add variant information
                 row_data.update(variant_info)
@@ -148,7 +129,7 @@ def list_overrides(
         case "csv":
             _export_csv(export_data, variant_names, output)
         case "table":
-            _export_table(export_data, variant_names)
+            _export_table(export_data, variant_names, output)
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
 
@@ -167,7 +148,11 @@ def _export_csv(
 ) -> None:
     """Export data as CSV."""
     # Define field names in the order we want them
-    fieldnames = ["package", "version", "patches"] + variants + ["plugin_hooks"]
+    fieldnames = (
+        ["package", "version", "patches", "min_release_age"]
+        + variants
+        + ["plugin_hooks"]
+    )
 
     if output:
         with open(output, "w", newline="") as outfile:
@@ -184,23 +169,34 @@ def _export_csv(
         writer.writerows(data)
 
 
-def _export_table(data: list[dict], variants: list[str]) -> None:
-    """Export data as Rich table (original behavior)."""
+def _export_table(
+    data: list[dict], variants: list[str], output: pathlib.Path | None = None
+) -> None:
+    """Export data as Rich table."""
     table = Table(title="Package Overrides")
     table.add_column("Package", justify="left", no_wrap=True)
     table.add_column("Version", justify="left", no_wrap=True)
     table.add_column("Patches", justify="left", no_wrap=True)
+
+    table.add_column("Min Release Age (days)", justify="left", no_wrap=True)
 
     for v in variants:
         table.add_column(v, justify="left", no_wrap=True)
 
     table.add_column("Plugin", justify="left")
 
-    # Define column keys in the same order as CSV exporter
-    column_keys = ["package", "version", "patches"] + variants + ["plugin_hooks"]
+    column_keys = (
+        ["package", "version", "patches", "min_release_age"]
+        + variants
+        + ["plugin_hooks"]
+    )
 
     for row_data in data:
         row = [row_data.get(key, "") for key in column_keys]
         table.add_row(*row)
 
-    rich.get_console().print(table)
+    if output:
+        with open(output, "w") as fh:
+            rich.console.Console(file=fh, width=120).print(table)
+    else:
+        rich.get_console().print(table)

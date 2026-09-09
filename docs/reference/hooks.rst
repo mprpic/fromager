@@ -121,6 +121,8 @@ Resolver hooks
 
 .. currentmodule:: fromager.resolver
 
+.. _resolver_provider_hook:
+
 .. autofromagerhook:: default_resolver_provider
 
     The ``get_resolver_provider()`` function allows an override to change
@@ -191,18 +193,10 @@ Source hooks
 
 .. currentmodule:: fromager.sources
 
-.. autofromagerhook:: default_resolve_source
-
-    The ``resolve_source()`` function is responsible for resolving a
-    requirement and acquiring the source for that version of a
-    package. The default is to use pypi.org to resolve the requirement.
-
-    The arguments are the ``WorkContext``, the ``Requirement`` being
-    evaluated, and the URL to the sdist index.
-
-    The return value is ``Tuple[str, Version]`` where the first member is
-    the url from which the source can be downloaded and the second member
-    is the version of the resolved package.
+.. versionremoved:: 0.80.0
+   The ``resolve_source`` hook and ``default_resolve_source`` function
+   were removed. Define a :ref:`resolver_provider <resolver_provider_hook>` hook
+   to resolve sources.
 
 .. autofromagerhook:: default_download_source
 
@@ -210,8 +204,7 @@ Source hooks
     source from a URL.
 
     The arguments are the ``WorkContext``, the ``Requirement`` being
-    evaluated, version of the package being downloaded, the URL
-    from which the source can be downloaded as returned by ``resolve_source``,
+    evaluated, version of the package being downloaded, the download URL,
     and the output directory in which the source should be downloaded.
 
     The return value should be a ``pathlib.Path`` file path to the downloaded source.

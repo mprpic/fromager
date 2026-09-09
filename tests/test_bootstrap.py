@@ -1,14 +1,15 @@
 import io
+import logging
 import pathlib
 import textwrap
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
 from click.testing import CliRunner
 from packaging.requirements import Requirement
-from packaging.version import Version
 
-from fromager import bootstrapper, context, dependency_graph, packagesettings
+from fromager import context, dependency_graph
 from fromager.commands import bootstrap
 
 
@@ -541,148 +542,207 @@ def test_skip_constraints_cli_option() -> None:
     assert "Skip generating constraints.txt file" in result.output
 
 
-@patch("fromager.gitutils.git_clone")
-def test_resolve_version_from_git_url_with_submodules_enabled(
-    mock_git_clone: Mock,
+@patch("fromager.commands.bootstrap.bootstrapper.Bootstrapper")
+@patch("fromager.commands.bootstrap.server.start_wheel_server")
+@patch("fromager.commands.bootstrap.progress.progress_context")
+@patch("fromager.commands.bootstrap.metrics.summarize")
+def test_multiple_versions_auto_disables_constraints(
+    mock_metrics: Mock,
+    mock_progress: Mock,
+    mock_server: Mock,
+    mock_bootstrapper: Mock,
+    tmp_context: context.WorkContext,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that --multiple-versions alone auto-disables constraints and logs message"""
+    # Setup mocks
+    mock_progress.return_value.__enter__.return_value = Mock()
+    mock_progress.return_value.__exit__.return_value = None
+    mock_bt_instance = Mock()
+    mock_bt_instance.__enter__ = Mock(return_value=mock_bt_instance)
+    mock_bt_instance.__exit__ = Mock(return_value=None)
+    mock_bt_instance.finalize.return_value = 0
+    mock_bootstrapper.return_value = mock_bt_instance
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        # Create a temporary requirements file
+        pathlib.Path("req.txt").write_text("setuptools>=60\n")
+
+        # Invoke with --multiple-versions but NOT --skip-constraints
+        with caplog.at_level(logging.INFO):
+            result = runner.invoke(
+                bootstrap.bootstrap,
+                [
+                    "-r",
+                    "req.txt",
+                    "--multiple-versions",
+                    "--max-release-age",
+                    "45",
+                ],
+                obj=tmp_context,
+            )
+
+        # Should succeed
+        assert result.exit_code == 0
+
+        # Should log that constraints are auto-disabled
+        assert "automatically disabling constraints generation" in caplog.text
+        assert "incompatible with --multiple-versions" in caplog.text
+
+
+@patch("fromager.commands.bootstrap.bootstrapper.Bootstrapper")
+@patch("fromager.commands.bootstrap.server.start_wheel_server")
+@patch("fromager.commands.bootstrap.progress.progress_context")
+@patch("fromager.commands.bootstrap.metrics.summarize")
+def test_multiple_versions_with_skip_constraints_no_duplicate_log(
+    mock_metrics: Mock,
+    mock_progress: Mock,
+    mock_server: Mock,
+    mock_bootstrapper: Mock,
+    tmp_context: context.WorkContext,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that --multiple-versions --skip-constraints together doesn't log auto-disable message"""
+    # Setup mocks
+    mock_progress.return_value.__enter__.return_value = Mock()
+    mock_progress.return_value.__exit__.return_value = None
+    mock_bt_instance = Mock()
+    mock_bt_instance.__enter__ = Mock(return_value=mock_bt_instance)
+    mock_bt_instance.__exit__ = Mock(return_value=None)
+    mock_bt_instance.finalize.return_value = 0
+    mock_bootstrapper.return_value = mock_bt_instance
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        # Create a temporary requirements file
+        pathlib.Path("req.txt").write_text("setuptools>=60\n")
+
+        # Invoke with BOTH --multiple-versions AND --skip-constraints
+        with caplog.at_level(logging.INFO):
+            result = runner.invoke(
+                bootstrap.bootstrap,
+                [
+                    "-r",
+                    "req.txt",
+                    "--multiple-versions",
+                    "--skip-constraints",
+                    "--max-release-age",
+                    "45",
+                ],
+                obj=tmp_context,
+            )
+
+        # Should succeed
+        assert result.exit_code == 0
+
+        # Should NOT log the auto-disable message (already disabled by user)
+        assert "automatically disabling constraints generation" not in caplog.text
+
+
+@patch("fromager.commands.bootstrap.bootstrapper.Bootstrapper")
+@patch("fromager.commands.bootstrap.server.start_wheel_server")
+@patch("fromager.commands.bootstrap.progress.progress_context")
+@patch("fromager.commands.bootstrap.metrics.summarize")
+@patch("fromager.commands.bootstrap.write_constraints_file")
+def test_without_multiple_versions_constraints_not_disabled(
+    mock_write_constraints: Mock,
+    mock_metrics: Mock,
+    mock_progress: Mock,
+    mock_server: Mock,
+    mock_bootstrapper: Mock,
     tmp_context: context.WorkContext,
 ) -> None:
-    """Test that git_clone is called with submodules=True when configured."""
-    req = Requirement("test-pkg @ git+https://github.com/example/repo.git")
+    """Test that without --multiple-versions, constraints are not auto-disabled"""
+    # Setup mocks
+    mock_progress.return_value.__enter__.return_value = Mock()
+    mock_progress.return_value.__exit__.return_value = None
+    mock_bt_instance = Mock()
+    mock_bt_instance.__enter__ = Mock(return_value=mock_bt_instance)
+    mock_bt_instance.__exit__ = Mock(return_value=None)
+    mock_bt_instance.finalize.return_value = 0
+    mock_bootstrapper.return_value = mock_bt_instance
+    mock_write_constraints.return_value = True
 
-    mock_git_options = packagesettings.GitOptions(submodules=True)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        # Create a temporary requirements file
+        pathlib.Path("req.txt").write_text("setuptools>=60\n")
 
-    with patch.object(tmp_context, "package_build_info") as mock_pbi:
-        mock_pbi_instance = Mock()
-        mock_pbi_instance.git_options = mock_git_options
-        mock_pbi.return_value = mock_pbi_instance
+        # Invoke WITHOUT --multiple-versions
+        result = runner.invoke(
+            bootstrap.bootstrap,
+            [
+                "-r",
+                "req.txt",
+            ],
+            obj=tmp_context,
+        )
 
-        with patch(
-            "fromager.bootstrapper.Bootstrapper._get_version_from_package_metadata"
-        ) as mock_get_version:
-            with patch("shutil.move"):
-                with patch("pathlib.Path.mkdir"):
-                    mock_get_version.return_value = Version("1.0.0")
+        # Should succeed
+        assert result.exit_code == 0
 
-                    # Execute
-                    bs = bootstrapper.Bootstrapper(tmp_context)
-                    try:
-                        bs._resolve_version_from_git_url(req)
-                    except AssertionError:
-                        # Expected since we're mocking everything
-                        pass
-
-    mock_git_clone.assert_called_once()
-    call_args = mock_git_clone.call_args
-    assert call_args.kwargs["submodules"] is True
-    assert call_args.kwargs["repo_url"] == "https://github.com/example/repo.git"
-    assert call_args.kwargs["ref"] is None
+        # write_constraints_file should have been called (constraints NOT disabled)
+        assert mock_write_constraints.called
 
 
-@patch("fromager.gitutils.git_clone")
-def test_resolve_version_from_git_url_with_specific_submodule_paths(
-    mock_git_clone: Mock,
+def test_max_release_age_rejects_zero(
     tmp_context: context.WorkContext,
 ) -> None:
-    """Test that git_clone is called with specific submodule paths when configured."""
-    req = Requirement("test-pkg @ git+https://github.com/example/repo.git")
-
-    mock_git_options = packagesettings.GitOptions(
-        submodule_paths=["vendor/lib1", "vendor/lib2"]
-    )
-
-    with patch.object(tmp_context, "package_build_info") as mock_pbi:
-        mock_pbi_instance = Mock()
-        mock_pbi_instance.git_options = mock_git_options
-        mock_pbi.return_value = mock_pbi_instance
-
-        with patch(
-            "fromager.bootstrapper.Bootstrapper._get_version_from_package_metadata"
-        ) as mock_get_version:
-            with patch("shutil.move"):
-                with patch("pathlib.Path.mkdir"):
-                    mock_get_version.return_value = Version("1.0.0")
-
-                    bs = bootstrapper.Bootstrapper(tmp_context)
-                    try:
-                        bs._resolve_version_from_git_url(req)
-                    except AssertionError:
-                        # Expected since we're mocking everything
-                        pass
-
-    mock_git_clone.assert_called_once()
-    call_args = mock_git_clone.call_args
-    assert call_args.kwargs["submodules"] == ["vendor/lib1", "vendor/lib2"]
+    """Test that --max-release-age 0 is rejected by Click's IntRange(min=1)."""
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        pathlib.Path("req.txt").write_text("setuptools>=60\n")
+        result = runner.invoke(
+            bootstrap.bootstrap,
+            [
+                "-r",
+                "req.txt",
+                "--max-release-age",
+                "0",
+            ],
+            obj=tmp_context,
+        )
+    assert result.exit_code == 2
 
 
-@patch("fromager.gitutils.git_clone")
-def test_resolve_version_from_git_url_with_submodules_disabled(
-    mock_git_clone: Mock,
+@patch("fromager.commands.bootstrap.bootstrapper.Bootstrapper")
+@patch("fromager.commands.bootstrap.server.start_wheel_server")
+@patch("fromager.commands.bootstrap.progress.progress_context")
+@patch("fromager.commands.bootstrap.metrics.summarize")
+def test_max_release_age_sets_context(
+    mock_metrics: Mock,
+    mock_progress: Mock,
+    mock_server: Mock,
+    mock_bootstrapper: Mock,
     tmp_context: context.WorkContext,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Test that git_clone is called with submodules=False by default."""
-    req = Requirement("test-pkg @ git+https://github.com/example/repo.git")
+    """Test that --max-release-age stores the value on WorkContext."""
+    mock_progress.return_value.__enter__.return_value = Mock()
+    mock_progress.return_value.__exit__.return_value = None
+    mock_bt_instance = Mock()
+    mock_bt_instance.__enter__ = Mock(return_value=mock_bt_instance)
+    mock_bt_instance.__exit__ = Mock(return_value=None)
+    mock_bt_instance.finalize.return_value = 0
+    mock_bootstrapper.return_value = mock_bt_instance
 
-    with patch(
-        "fromager.bootstrapper.Bootstrapper._get_version_from_package_metadata"
-    ) as mock_get_version:
-        with patch("shutil.move"):
-            with patch("pathlib.Path.mkdir"):
-                mock_get_version.return_value = Version("1.0.0")
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        pathlib.Path("req.txt").write_text("setuptools>=60\n")
+        with caplog.at_level(logging.INFO):
+            result = runner.invoke(
+                bootstrap.bootstrap,
+                [
+                    "-r",
+                    "req.txt",
+                    "--multiple-versions",
+                    "--max-release-age",
+                    "45",
+                ],
+                obj=tmp_context,
+            )
 
-                bs = bootstrapper.Bootstrapper(tmp_context)
-                try:
-                    bs._resolve_version_from_git_url(req)
-                except AssertionError:
-                    # Expected since we're mocking everything
-                    pass
-
-    mock_git_clone.assert_called_once()
-    call_args = mock_git_clone.call_args
-    assert call_args.kwargs["submodules"] is False
-
-
-@patch("fromager.gitutils.git_clone")
-def test_resolve_version_from_git_url_with_git_ref(
-    mock_git_clone: Mock,
-    tmp_context: context.WorkContext,
-) -> None:
-    """Test that git_clone is called with the correct ref when URL includes @ref."""
-    req = Requirement("test-pkg @ git+https://github.com/example/repo.git@v1.2.3")
-
-    mock_git_options = packagesettings.GitOptions(submodules=True)
-
-    with patch.object(tmp_context, "package_build_info") as mock_pbi:
-        mock_pbi_instance = Mock()
-        mock_pbi_instance.git_options = mock_git_options
-        mock_pbi.return_value = mock_pbi_instance
-
-        with patch(
-            "fromager.bootstrapper.Bootstrapper._get_version_from_package_metadata"
-        ) as mock_get_version:
-            with patch("shutil.move"):
-                with patch("pathlib.Path.mkdir"):
-                    mock_get_version.return_value = Version("1.2.3")
-
-                    bs = bootstrapper.Bootstrapper(tmp_context)
-                    try:
-                        bs._resolve_version_from_git_url(req)
-                    except AssertionError:
-                        # Expected since we're mocking everything
-                        pass
-
-    mock_git_clone.assert_called_once()
-    call_args = mock_git_clone.call_args
-    assert call_args.kwargs["submodules"] is True
-    assert call_args.kwargs["repo_url"] == "https://github.com/example/repo.git"
-    assert call_args.kwargs["ref"] == "v1.2.3"
-
-
-def test_resolve_version_from_git_url_invalid_scheme(
-    tmp_context: context.WorkContext,
-) -> None:
-    """Test that non-git URLs raise ValueError."""
-    req = Requirement("test-pkg @ https://github.com/example/repo.git")
-
-    bs = bootstrapper.Bootstrapper(tmp_context)
-    with pytest.raises(ValueError, match="unable to handle URL scheme"):
-        bs._resolve_version_from_git_url(req)
+    assert result.exit_code == 0
+    assert tmp_context.max_release_age == timedelta(days=45)
+    assert "rejecting versions older than 45 days" in caplog.text

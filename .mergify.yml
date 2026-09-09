@@ -36,8 +36,10 @@ pull_request_rules:
           - check-success=unit (3.14, 1.75, ubuntu-latest)
           - check-success=unit (3.14, 1.75, macos-latest)
 
-          # MyPy type checking
-          - check-success=mypy
+          # checks (see check.yaml)
+          - check-success=pre-commit
+          - check-success=pkglint
+          - check-success=readthedocs
 
           # E2E test suites (consolidated from individual tests)
           # Python 3.12 - Ubuntu only (macOS excluded)
@@ -75,3 +77,13 @@ pull_request_rules:
     actions:
       merge:
         method: merge
+
+  - name: Ping author on conflicts
+    conditions:
+      - "conflict"
+      - "-closed"
+    actions:
+      comment:
+        message: |
+          This pull request has merge conflicts that must be resolved before it can be merged.
+          @{{ author }} please rebase your branch.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import dataclasses
 import graphlib
 import json
@@ -158,6 +159,24 @@ class DependencyNode:
             ):
                 yield install_edge.destination_node
 
+    def iter_all_dependencies(self) -> typing.Iterable[DependencyNode]:
+        """Get all unique, recursive dependencies following every edge type.
+
+        Yields every reachable node exactly once using iterative DFS.
+        Follows install, build, and toplevel edges.
+        """
+        visited: set[str] = {self.key}
+        stack: list[DependencyNode] = [self]
+        while stack:
+            current = stack.pop()
+            for edge in current.children:
+                child_node = edge.destination_node
+                if child_node.key in visited:
+                    continue
+                visited.add(child_node.key)
+                yield child_node
+                stack.append(child_node)
+
     def iter_install_requirements(self) -> typing.Iterable[DependencyNode]:
         """Get all unique, recursive install requirements"""
         visited: set[str] = set()
@@ -169,6 +188,8 @@ class DependencyNode:
         start_edges: list[DependencyEdge],
         visited: set[str],
     ) -> typing.Iterable[DependencyEdge]:
+        # Depth-first walk of install requirement edges, skipping nodes
+        # already visited to avoid loops in the dependency graph.
         for edge in start_edges:
             if edge.key in visited:
                 continue
@@ -220,6 +241,9 @@ class DependencyGraph:
         graph_dict: dict[str, dict[str, typing.Any]],
     ) -> DependencyGraph:
         graph = cls()
+        # Stack-based DFS to reconstruct graph from serialized dict,
+        # skipping nodes already visited to avoid processing shared
+        # dependencies twice.
         stack = [ROOT]
         visited = set()
         while stack:
@@ -336,6 +360,70 @@ class DependencyGraph:
 
         self.nodes[parent_key].add_child(node, req=req, req_type=req_type)
 
+    def remove_dependency(
+        self,
+        req_name: NormalizedName,
+        req_version: Version,
+    ) -> None:
+        """Remove a dependency node and any orphaned descendants from the graph.
+
+        Removes the node and all edges pointing to it. Child nodes that have
+        no remaining parents after removal are iteratively removed as well.
+
+        Args:
+            req_name: Canonical name of the package
+            req_version: Version of the package
+        """
+        key = f"{req_name}=={req_version}"
+        if key not in self.nodes:
+            logger.debug(f"Cannot remove {key} - not in graph")
+            return
+
+        queue: collections.deque[str] = collections.deque([key])
+
+        # BFS over orphaned descendants
+        while queue:
+            key = queue.popleft()
+            # This is a defensive check, should not happen in normal operation
+            if key not in self.nodes:
+                logger.debug(f"Cannot remove {key} - not in graph")
+                continue
+
+            logger.debug(f"Removing failed dependency {key} from graph")
+
+            deleted_node = self.nodes[key]
+
+            # Remove references to this node from its direct children
+            children = []
+            for child_edge in deleted_node.children:
+                child_node = child_edge.destination_node
+                filtered_parents = [
+                    edge
+                    for edge in child_node.parents
+                    if edge.destination_node.key != key
+                ]
+                child_node.parents.clear()
+                child_node.parents.extend(filtered_parents)
+                children.append(child_node)
+
+            # Remove references to this node from its direct parents
+            for parent_edge in deleted_node.parents:
+                parent_node = parent_edge.destination_node
+                filtered_children = [
+                    edge
+                    for edge in parent_node.children
+                    if edge.destination_node.key != key
+                ]
+                parent_node.children.clear()
+                parent_node.children.extend(filtered_children)
+
+            del self.nodes[key]
+
+            # Enqueue children that have become orphans
+            for child in children:
+                if child.key != ROOT and child.key in self.nodes and not child.parents:
+                    queue.append(child.key)
+
     def get_dependency_edges(
         self, match_dep_types: list[RequirementType] | None = None
     ) -> typing.Iterable[DependencyEdge]:
@@ -366,19 +454,6 @@ class DependencyGraph:
 
     def get_root_node(self) -> DependencyNode:
         return self.nodes[ROOT]
-
-    def get_top_level_requirement(self, node: DependencyNode) -> Requirement | None:
-        """Get the top-level requirement specification for a node.
-
-        For packages that were specified as top-level requirements (e.g., with git URLs),
-        this returns the original requirement specification. Returns None if the node
-        is not a direct child of ROOT.
-        """
-        root = self.get_root_node()
-        for edge in node.parents:
-            if edge.destination_node is root:
-                return edge.req
-        return None
 
     def get_all_nodes(self) -> typing.Iterable[DependencyNode]:
         return self.nodes.values()

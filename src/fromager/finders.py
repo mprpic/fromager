@@ -8,12 +8,62 @@ import typing
 from packaging.requirements import Requirement
 from packaging.utils import BuildTag, canonicalize_name
 
-from . import overrides
+from . import overrides, resolver
+from .constraints import Constraints
+from .requirements_file import RequirementType
 
 if typing.TYPE_CHECKING:
     from . import context
 
 logger = logging.getLogger(__name__)
+
+
+class PyPICacheProvider(resolver.PyPIProvider):
+    """Provider for Fromager's PyPI-compatible cache server.
+
+    Wraps ``PyPIProvider`` with a simplified interface tailored for cache
+    usage: no ``ignore_platform``, no ``override_download_url``, no
+    ``supports_upload_time``, and ``cooldown`` is always ``None``.
+
+    ``include_wheels`` and ``include_sdists`` are mutually exclusive;
+    exactly one must be ``True``.  Defaults to wheels only.
+
+    .. caution::
+       Only use the ``PyPICacheProvider`` with an internal and fully-trusted
+       cache index. Packages are not subject to cooldown or other checks.
+    """
+
+    provider_description: typing.ClassVar[str] = (
+        "PyPI cache resolver (searching at {self.sdist_server_url})"
+    )
+
+    def __init__(
+        self,
+        *,
+        cache_server_url: str,
+        include_sdists: bool = False,
+        include_wheels: bool = True,
+        constraints: Constraints | None = None,
+        req_type: RequirementType | None = None,
+        use_resolver_cache: bool = True,
+    ):
+        if include_sdists == include_wheels:
+            raise ValueError(
+                "include_sdists and include_wheels are mutually exclusive, "
+                "exactly one must be True"
+            )
+        super().__init__(
+            include_sdists=include_sdists,
+            include_wheels=include_wheels,
+            sdist_server_url=cache_server_url,
+            constraints=constraints,
+            req_type=req_type,
+            ignore_platform=False,
+            use_resolver_cache=use_resolver_cache,
+            override_download_url=None,
+            cooldown=None,
+            supports_upload_time=False,
+        )
 
 
 def _dist_name_to_filename(dist_name: str) -> str:
@@ -40,6 +90,14 @@ def find_sdist(
     req: Requirement,
     dist_version: str,
 ) -> pathlib.Path | None:
+    """Find an sdist archive in downloads_dir for the given requirement.
+
+    First checks for a plugin-provided exact filename. If no plugin match,
+    tries four naming conventions (underscore-normalized, canonical, original,
+    and dotted) with case-insensitive comparison to handle inconsistent
+    sdist naming across the Python ecosystem. Case-insensitive globbing
+    is not available before Python 3.12.
+    """
     sdist_file_name = overrides.find_and_invoke(
         req.name,
         "expected_source_archive_name",
@@ -95,6 +153,13 @@ def find_wheel(
     dist_version: str,
     build_tag: BuildTag = (),
 ) -> pathlib.Path | None:
+    """Find a wheel file in downloads_dir for the given requirement.
+
+    Tries four naming conventions (PEP 427 transformed, canonical, original,
+    and dotted), each suffixed with the build tag when present. Uses
+    case-insensitive ``startswith`` matching rather than exact base comparison
+    because wheel filenames include platform/Python tags after the version.
+    """
     filename_prefix = _dist_name_to_filename(req.name)
     canonical_name = canonicalize_name(req.name)
     # if build tag is 0 then we can ignore to handle non tagged wheels for backward compatibility
@@ -123,7 +188,7 @@ def find_wheel(
     # comparison.
     for base in candidate_bases:
         logger.debug('looking for wheel as "%s"', base)
-        for filename in downloads_dir.glob("*"):
+        for filename in downloads_dir.glob("*.whl"):
             if str(filename.name).lower().startswith(base.lower()):
                 return filename
 
@@ -140,6 +205,15 @@ def find_source_dir(
     req: Requirement,
     dist_version: str,
 ) -> pathlib.Path | None:
+    """Find the unpacked source directory for a requirement.
+
+    Tries three strategies in order:
+    1. Plugin override providing the exact directory name
+    2. Derive from the sdist archive name (strip extension), assuming the
+       unpacked layout is ``<base>/<base>/`` (double-nested)
+    3. Fall back to four naming conventions with case-insensitive matching,
+       returning ``<match>/<match>/`` (same double-nested convention)
+    """
     sdir_name_func = overrides.find_override_method(
         req.name, "expected_source_directory_name"
     )

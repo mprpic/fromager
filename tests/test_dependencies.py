@@ -181,6 +181,7 @@ def test_get_build_system_dependencies_cached(
 
 @patch("fromager.dependencies._write_requirements_file")
 @_clean_build_artifacts
+@pytest.mark.network
 def test_get_build_backend_dependencies(
     _: Mock, tmp_context: context.WorkContext, tmp_path: pathlib.Path
 ) -> None:
@@ -190,9 +191,12 @@ def test_get_build_backend_dependencies(
     tmp_context.wheel_server_url = "https://pypi.org/simple"
 
     req = Requirement("fromager")
+    sdist_root = tmp_path / "fromager-1.0.0"
+    sdist_root.mkdir()
     build_env = build_environment.BuildEnvironment(
         ctx=tmp_context,
-        parent_dir=tmp_path,
+        req=req,
+        sdist_root_dir=sdist_root,
     )
     build_system_dependencies = dependencies.get_build_system_dependencies(
         ctx=tmp_context,
@@ -222,9 +226,11 @@ def test_get_build_backend_dependencies_cached(
     req_file = tmp_path / "build-backend-requirements.txt"
     req_file.write_text("foo==1.0")
 
+    req = Requirement("fromager")
     build_env = build_environment.BuildEnvironment(
         ctx=tmp_context,
-        parent_dir=tmp_path,
+        req=req,
+        sdist_root_dir=sdist_root_dir,
     )
     results = dependencies.get_build_backend_dependencies(
         ctx=tmp_context,
@@ -238,6 +244,7 @@ def test_get_build_backend_dependencies_cached(
 
 @patch("fromager.dependencies._write_requirements_file")
 @_clean_build_artifacts
+@pytest.mark.network
 def test_get_build_sdist_dependencies(
     _: Mock, tmp_context: context.WorkContext, tmp_path: pathlib.Path
 ) -> None:
@@ -247,9 +254,12 @@ def test_get_build_sdist_dependencies(
     tmp_context.wheel_server_url = "https://pypi.org/simple"
 
     req = Requirement("fromager")
+    sdist_root = tmp_path / "fromager-1.0.0"
+    sdist_root.mkdir()
     build_env = build_environment.BuildEnvironment(
         ctx=tmp_context,
-        parent_dir=tmp_path,
+        req=req,
+        sdist_root_dir=sdist_root,
     )
     build_system_dependencies = dependencies.get_build_system_dependencies(
         ctx=tmp_context,
@@ -282,7 +292,8 @@ def test_get_build_sdist_dependencies_cached(
     req = Requirement("fromager")
     build_env = build_environment.BuildEnvironment(
         ctx=tmp_context,
-        parent_dir=tmp_path,
+        req=req,
+        sdist_root_dir=sdist_root_dir,
     )
     results = dependencies.get_build_sdist_dependencies(
         ctx=tmp_context,
